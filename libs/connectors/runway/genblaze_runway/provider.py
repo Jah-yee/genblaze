@@ -3,17 +3,31 @@
 Uses the runwayml Python SDK with async task-based workflow:
   client.image_to_video.create() → poll task → get output URL
 
-Models, pricing, and parameter handling are driven by the ``ModelRegistry``
-returned from ``create_registry()``. Users can override pricing or register
-new models via::
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships pattern-keyed
+``ModelFamily`` rules rather than a hardcoded slug list. The Runway Gen
+family captures any ``gen<N>[a]_turbo`` slug — Gen-3, Gen-3a, Gen-4,
+plus future variants (Gen-5, Gen-4a, etc.) inherit the same param shape
+without an SDK release.
 
-    provider = RunwayProvider(models=my_registry)
+**DiscoverySupport.NONE**: Runway has no ``GET /v1/models`` endpoint and
+the runwayml SDK doesn't expose raw HTTP for the empty-payload probe
+pattern. The catalog is small and stable; submit-time errors are the
+authoritative liveness signal. Pipeline preflight emits
+``OK_PROVISIONAL`` (matched a family) or ``UNKNOWN_PERMISSIVE`` for
+unrecognized slugs — neither raises pre-flight.
+
+**Pricing**: Runway was previously hardcoded as ``(model, duration) →
+USD`` (Gen-4 Turbo: $0.50 / $1.00 for 5s / 10s; Gen-3a Turbo: $0.25 /
+$0.50). As of 0.3.0 the SDK no longer ships pricing — register the
+recipe yourself if you want cost tracking. See
+``docs/reference/pricing-recipes.md`` for the canonical Runway recipe.
 
 Docs: https://docs.runwayml.com/
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from genblaze_core.exceptions import ProviderError
@@ -22,11 +36,12 @@ from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
     BaseProvider,
+    DiscoverySupport,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
-    by_model_and_param,
     route_images,
     validate_asset_url,
 )
@@ -37,14 +52,6 @@ from ._errors import map_runway_error
 
 _VALID_DURATIONS = frozenset({5, 10})
 _VALID_RATIOS = frozenset({"16:9", "9:16"})
-
-# Per-generation pricing keyed by (model, duration) in USD.
-_RUNWAY_PRICING: dict[tuple[str, Any], float] = {
-    ("gen4_turbo", 5): 0.50,
-    ("gen4_turbo", 10): 1.00,
-    ("gen3a_turbo", 5): 0.25,
-    ("gen3a_turbo", 10): 0.50,
-}
 
 
 def _check_ratio(params: dict[str, Any]) -> None:
@@ -76,45 +83,69 @@ def _check_duration(params: dict[str, Any]) -> None:
     params["duration"] = dur
 
 
-def _runway_spec(model_id: str) -> ModelSpec:
-    """Build the per-model spec.
-
-    All Runway models share the same shape: ``aspect_ratio`` aliases to
-    ``ratio``, ``duration`` must be 5 or 10, the first chained image becomes
-    ``prompt_image``, and pricing is keyed on ``(model, duration)``.
-    """
-    # Validation lives in ``param_constraints`` rather than ``param_schemas``
-    # so the connector can keep its bespoke "Invalid duration=…" wording the
-    # public tests assert on.
-    return ModelSpec(
-        model_id=model_id,
+# Single family covering the Runway Gen video catalog. The pattern
+# ``^gen\w+_turbo$`` absorbs current (gen3a_turbo, gen4_turbo) and any
+# future (gen4a_turbo, gen5_turbo, etc.) variants without a code
+# change. Constraints (duration ∈ {5, 10}, ratio ∈ {16:9, 9:16}) are
+# Runway-wide rather than per-model, so they live on the family
+# spec_template.
+_RUNWAY_GEN_FAMILY = ModelFamily(
+    name="runway-gen-video",
+    pattern=re.compile(r"^gen\w+_turbo$"),
+    spec_template=ModelSpec(
+        model_id="*",
         modality=Modality.VIDEO,
-        pricing=by_model_and_param("duration", _RUNWAY_PRICING),
         param_aliases={"aspect_ratio": "ratio"},
         param_constraints=(_check_duration, _check_ratio),
         input_mapping=route_images(slots=("prompt_image",)),
-    )
+    ),
+    description="Runway Gen video family (Gen-3a, Gen-4, future *_turbo variants).",
+    example_slugs=("gen4_turbo", "gen3a_turbo"),
+)
+
+
+_FALLBACK = ModelSpec(
+    model_id="*",
+    modality=Modality.VIDEO,
+    param_aliases={"aspect_ratio": "ratio"},
+    input_mapping=route_images(slots=("prompt_image",)),
+)
 
 
 class RunwayProvider(BaseProvider):
     """Provider adapter for Runway video generation (Gen-3, Gen-4).
 
-    Models: ``gen4_turbo``, ``gen3a_turbo``.
+    Models match the ``runway-gen-video`` family (any ``gen<N>[a]_turbo``
+    slug). Duration must be 5 or 10; aspect ratio must be 16:9 or 9:16.
 
-    Auth: Set RUNWAYML_API_SECRET env var or pass api_secret.
+    Auth: Set ``RUNWAYML_API_SECRET`` env var or pass ``api_secret``.
 
     Args:
-        api_secret: Runway API secret. Falls back to RUNWAYML_API_SECRET env var.
+        api_secret: Runway API secret. Falls back to ``RUNWAYML_API_SECRET``
+            env var.
         poll_interval: Seconds between task status polls (default 5).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance TTL for the probe cache (unused for
+            ``DiscoverySupport.NONE`` providers but accepted for ctor
+            compatibility with sibling connectors).
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "runway"
+    discovery_support = DiscoverySupport.NONE
+    """Runway has no ``GET /v1/models`` endpoint and the runwayml SDK
+    doesn't expose raw HTTP for the empty-payload probe pattern. The
+    catalog is small (2 models today) and stable — submit-time errors
+    are the authoritative liveness signal. Pipeline preflight emits
+    ``OK_PROVISIONAL`` for family-matched slugs."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        defaults = {mid: _runway_spec(mid) for mid in ("gen4_turbo", "gen3a_turbo")}
-        return ModelRegistry(defaults=defaults)
+        return ModelRegistry(
+            provider_families=(_RUNWAY_GEN_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Runway: video generation from text and/or image inputs."""
@@ -134,8 +165,15 @@ class RunwayProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._api_secret = api_secret
         self._client: Any = None
@@ -273,10 +311,10 @@ class RunwayProvider(BaseProvider):
             else:
                 raise ProviderError("Runway task completed but no output URL found")
 
-            # Pricing is keyed on (model, duration); default duration is 5s
-            # when the user didn't specify one. Mutate step.params so the
-            # registry strategy sees the effective value, matching the legacy
-            # behavior where 5s was assumed for cost.
+            # Default duration is 5s when the user didn't specify one — kept
+            # so VideoMetadata.duration is populated consistently regardless
+            # of whether the caller supplied the param. (Pricing was
+            # previously also keyed off this; no longer SDK state.)
             duration = int(step.params.get("duration", 5))
             step.params.setdefault("duration", duration)
             for a in step.assets:

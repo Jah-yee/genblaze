@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the authoritative answer at runtime; users see a "known unstable"
     hint at preflight. PascalCase `deprecated_aliases` are removed
     (soft-launch clean break); pass canonical lowercase slugs.
+  - **runway** — `DiscoverySupport.NONE` with a single
+    `runway-gen-video` family covering `^gen\w+_turbo$` (Gen-3a,
+    Gen-4, future variants). The runwayml SDK doesn't expose raw HTTP
+    for the empty-payload probe pattern, so submit-time errors are the
+    authoritative liveness signal. Pricing tables removed; recipe
+    published at `docs/reference/pricing-recipes.md`.
 
 ### Fixed — F-2026-05-04-01 (NVIDIA `nvidia/riva-tts` 404)
 

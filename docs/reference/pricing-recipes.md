@@ -279,10 +279,46 @@ video.models.register_pricing("seedance-2-0-260128", per_duration(0.052))
 
 ---
 
+## Runway
+
+**Source:** module-level constant `_RUNWAY_PRICING: dict[tuple[str, Any],
+float]` keyed by `(model, duration)` in `genblaze_runway/provider.py`
+prior to `genblaze-core 0.3.0`.
+**Snapshot date:** 2026-05-05.
+**Verify at:** [docs.runwayml.com](https://docs.runwayml.com/).
+
+Runway bills per-generation, with rates depending on the model variant
+and the requested duration (5s vs 10s).
+
+```python
+from genblaze_core.providers import by_model_and_param
+from genblaze_runway import RunwayProvider
+
+# (model, duration_seconds) → USD per generation, snapshot 2026-05-05.
+RUNWAY_RATES: dict = {
+    ("gen4_turbo", 5): 0.50,
+    ("gen4_turbo", 10): 1.00,
+    ("gen3a_turbo", 5): 0.25,
+    ("gen3a_turbo", 10): 0.50,
+}
+
+provider = RunwayProvider(api_secret="...")
+for slug in ("gen4_turbo", "gen3a_turbo"):
+    provider.models.register_pricing(
+        slug, by_model_and_param("duration", RUNWAY_RATES)
+    )
+```
+
+Future Runway variants (Gen-5, Gen-4a, etc.) match the
+`runway-gen-video` family pattern automatically but won't have rates
+in this recipe — extend `RUNWAY_RATES` and re-register as new slugs
+ship.
+
+---
+
 <!--
   Subsequent connectors append their sections here as they migrate:
     - nvidia (chat / generative)
-    - runway
     - decart
     - elevenlabs
     - openai

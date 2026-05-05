@@ -84,21 +84,41 @@ def test_invalid_duration_raises(mock_runway):
         provider.submit(step)
 
 
-def test_cost_tracked(mock_runway):
-    """Cost is set based on model and duration."""
+def test_cost_none_by_default(mock_runway):
+    """As of genblaze-core 0.3.0 the SDK no longer ships pricing for
+    Runway. cost_usd is None unless the user has registered pricing
+    via ``provider.models.register_pricing()``. See
+    ``docs/reference/pricing-recipes.md`` for the canonical recipe.
+    """
     provider, _ = mock_runway
     step = Step(provider="runway", model="gen4_turbo", prompt="a sunset", params={"duration": 10})
     result = provider.fetch_output("task-abc", step)
-    assert result.cost_usd is not None
-    assert result.cost_usd == 1.00
+    assert result.cost_usd is None
 
 
-def test_cost_tracked_default_duration(mock_runway):
-    """Default 5s duration uses 5s price."""
+def test_cost_tracked_with_user_registered_pricing(mock_runway):
+    """User-registered (model, duration) pricing flows through compute_cost.
+
+    Demonstrates the standard recipe shape: register a strategy that
+    reads ``step.params.get('duration')`` and looks up a static
+    ``(model_id, duration) → rate`` table.
+    """
+    from genblaze_core.providers import by_model_and_param
+
+    runway_rates: dict = {
+        ("gen4_turbo", 5): 0.50,
+        ("gen4_turbo", 10): 1.00,
+        ("gen3a_turbo", 5): 0.25,
+        ("gen3a_turbo", 10): 0.50,
+    }
     provider, _ = mock_runway
-    step = Step(provider="runway", model="gen4_turbo", prompt="a sunset")
+    # Fork before mutating to avoid polluting the class-level
+    # models_default() cache (would affect sibling tests).
+    provider._models = provider.models.fork()
+    provider.models.register_pricing("gen4_turbo", by_model_and_param("duration", runway_rates))
+    step = Step(provider="runway", model="gen4_turbo", prompt="a sunset", params={"duration": 10})
     result = provider.fetch_output("task-abc", step)
-    assert result.cost_usd == 0.50
+    assert result.cost_usd == 1.00
 
 
 def test_cost_none_unknown_model(mock_runway):
@@ -176,6 +196,11 @@ def test_poll_progress_omits_missing_fields(mock_runway):
 
 class TestRunwayCompliance(ProviderComplianceTests):
     """Verify RunwayProvider satisfies the genblaze provider contract."""
+
+    # As of genblaze-core 0.3.0 the SDK ships zero hardcoded prices for
+    # Runway. Users register pricing via ``register_pricing()``; see
+    # ``docs/reference/pricing-recipes.md`` for the canonical recipe.
+    expects_cost = False
 
     @pytest.fixture(autouse=True)
     def _patch_sdk(self):

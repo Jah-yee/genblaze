@@ -510,7 +510,7 @@ Per the audit performed for this plan:
 | `luma` | enumerated | `None` | `PARTIAL` | yes |
 | `openai` | enumerated | `per_input_chars`, `None` | `NATIVE` | n/a |
 | `replicate` | already empty + fallback | `per_response_metric` | `NATIVE` | n/a |
-| `runway` | enumerated | `by_model_and_param` | `PARTIAL` | yes |
+| `runway` | enumerated | `by_model_and_param` | `NONE` (revised from `PARTIAL` during PR #6 — runwayml SDK doesn't expose raw HTTP for the empty-payload trick; small fixed catalog makes submit-time errors enough) | n/a |
 | `stability-audio` | single-model dict | `per_second` | `NONE` | no |
 | `s3`, `langsmith` | n/a | n/a | n/a — exempt | n/a |
 
