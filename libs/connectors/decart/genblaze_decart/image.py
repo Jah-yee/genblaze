@@ -2,8 +2,18 @@
 
 Uses the synchronous process() API for image models.
 
-Models and pricing are driven by the ``ModelRegistry`` returned from
-``create_registry()``. Image pricing is a flat per-generation rate.
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships a
+pattern-keyed ``ModelFamily`` rather than a hardcoded slug list. The
+``decart-lucy-image`` family captures any ``lucy-`` slug ending in
+``2i`` (t2i, i2i — current and future Lucy image variants).
+
+**DiscoverySupport.NONE**: same rationale as the video provider — no
+``GET /v1/models`` endpoint, decart SDK doesn't expose raw HTTP, small
+stable catalog.
+
+**Pricing**: previously hardcoded at ``$0.02 / generation``. As of
+0.3.0 the SDK no longer ships pricing — see
+``docs/reference/pricing-recipes.md`` for the canonical Decart recipe.
 
 Docs: https://docs.platform.decart.ai/
 """
@@ -11,6 +21,7 @@ Docs: https://docs.platform.decart.ai/
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,41 +33,37 @@ from genblaze_core.models.asset import Asset
 from genblaze_core.models.enums import Modality
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
+    DiscoverySupport,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
     SyncProvider,
-    per_unit,
 )
 from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
 from ._errors import map_decart_error
 
-# Supported image models
-_IMAGE_MODELS = (
-    "lucy-pro-t2i",
-    "lucy-pro-i2i",
+# Lucy image family — pattern matches t2i / i2i variants. Future Lucy
+# image slugs (lucy-3-t2i, lucy-edit-i2i, etc.) inherit automatically.
+_DECART_LUCY_IMAGE_FAMILY = ModelFamily(
+    name="decart-lucy-image",
+    pattern=re.compile(r"^lucy-.*2i$"),
+    spec_template=ModelSpec(model_id="*", modality=Modality.IMAGE),
+    description="Decart Lucy image family — text-to-image and image-to-image variants.",
+    example_slugs=("lucy-pro-t2i", "lucy-pro-i2i"),
 )
 
-# Flat per-generation price (USD) across all Decart image models.
-_IMAGE_PRICE = 0.02
 
-
-def _image_spec(model_id: str) -> ModelSpec:
-    """Per-model spec — flat per-asset pricing."""
-    return ModelSpec(
-        model_id=model_id,
-        modality=Modality.IMAGE,
-        pricing=per_unit(_IMAGE_PRICE),
-    )
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.IMAGE)
 
 
 class DecartImageProvider(SyncProvider):
     """Provider adapter for Decart Lucy image generation.
 
-    Models: ``lucy-pro-t2i``, ``lucy-pro-i2i``.
+    Models match the ``decart-lucy-image`` family — any ``lucy-*-2i`` slug.
 
     Auth: Set DECART_API_KEY env var or pass api_key.
 
@@ -64,13 +71,22 @@ class DecartImageProvider(SyncProvider):
         api_key: Decart API key. Falls back to DECART_API_KEY env var.
         output_dir: Directory for output files (default system temp).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL (no-op for NONE).
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "decart-image"
+    discovery_support = DiscoverySupport.NONE
+    """Same rationale as DecartVideoProvider — no /v1/models endpoint,
+    SDK-only access, small stable catalog."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        return ModelRegistry(defaults={mid: _image_spec(mid) for mid in _IMAGE_MODELS})
+        return ModelRegistry(
+            provider_families=(_DECART_LUCY_IMAGE_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Decart Lucy: image generation from text prompts."""
@@ -88,8 +104,15 @@ class DecartImageProvider(SyncProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._output_dir = Path(output_dir) if output_dir else None
         self._client: Any = None

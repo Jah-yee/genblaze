@@ -1753,8 +1753,15 @@ class SyncProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ) -> None:
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         # Results keyed by step_id — avoids monkey-patching Pydantic models
         self._sync_results: dict[str, Step] = {}
 

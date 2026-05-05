@@ -3,9 +3,21 @@
 Uses the decart Python SDK with async queue-based workflow:
   client.queue.submit() → poll status → download result
 
-Models, pricing, and parameter handling are driven by the ``ModelRegistry``
-returned from ``create_registry()``. Pricing is keyed off the ``resolution``
-param (480p vs 720p).
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships a
+pattern-keyed ``ModelFamily`` rather than a hardcoded slug list. The
+Lucy video family captures any ``lucy-*`` slug not matching the image
+family — current Lucy Pro / Lucy 2 / Lucy Fast / Lucy Dev / Lucy Motion
+/ Lucy Restyle variants and any future Lucy video slug inherit the
+same param shape (resolution enum, enhance_prompt bool).
+
+**DiscoverySupport.NONE**: Decart has no ``GET /v1/models`` endpoint
+and the decart SDK doesn't expose raw HTTP for the empty-payload probe
+pattern. The catalog is small and stable; submit-time errors are the
+authoritative liveness signal.
+
+**Pricing**: previously hardcoded as ``resolution → USD`` (480p: $0.04;
+720p: $0.08). As of 0.3.0 the SDK no longer ships pricing — see
+``docs/reference/pricing-recipes.md`` for the canonical Decart recipe.
 
 Docs: https://docs.platform.decart.ai/
 """
@@ -13,6 +25,7 @@ Docs: https://docs.platform.decart.ai/
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -25,12 +38,13 @@ from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
     BoolSchema,
+    DiscoverySupport,
     EnumSchema,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
-    by_param,
 )
 from genblaze_core.providers.base import BaseProvider
 from genblaze_core.providers.retry import retry_after_from_response
@@ -38,47 +52,48 @@ from genblaze_core.runnable.config import RunnableConfig
 
 from ._errors import map_decart_error
 
-# Supported video models
-_VIDEO_MODELS = (
-    "lucy-pro-t2v",
-    "lucy-pro-i2v",
-    "lucy-pro-v2v",
-    "lucy-2-v2v",
-    "lucy-fast-v2v",
-    "lucy-motion",
-    "lucy-dev-i2v",
-    "lucy-restyle-v2v",
-)
-
 _VALID_RESOLUTIONS = frozenset({"480p", "720p"})
 
-# Per-generation pricing by resolution (USD). Default is the 480p tier —
-# matches the historical "fall through to 480p when resolution is missing"
-# behavior.
-_VIDEO_PRICING: dict[str, float] = {
-    "480p": 0.04,
-    "720p": 0.08,
-}
 
-
-def _video_spec(model_id: str) -> ModelSpec:
-    """Per-model spec — pricing keyed by the ``resolution`` param."""
-    return ModelSpec(
-        model_id=model_id,
+# The Lucy video family covers every ``lucy-*-{t2v,i2v,v2v,motion,
+# restyle-*}`` slug. ``-2v$|motion$|restyle`` keeps image slugs
+# (``lucy-pro-t2i`` / ``lucy-pro-i2i``) out — they belong to the image
+# provider's family. Future Lucy video slugs (lucy-3-v2v, lucy-cinema,
+# etc.) inherit automatically.
+_DECART_LUCY_VIDEO_FAMILY = ModelFamily(
+    name="decart-lucy-video",
+    pattern=re.compile(r"^lucy-.*(?:2v|motion|restyle)"),
+    spec_template=ModelSpec(
+        model_id="*",
         modality=Modality.VIDEO,
-        pricing=by_param("resolution", _VIDEO_PRICING, default=_VIDEO_PRICING["480p"]),
         param_coercers={"enhance_prompt": bool},
         param_schemas={
             "resolution": EnumSchema(values=_VALID_RESOLUTIONS),
             "enhance_prompt": BoolSchema(),
         },
-    )
+    ),
+    description="Decart Lucy video family — Lucy Pro / 2 / Fast / Dev / Motion / Restyle.",
+    example_slugs=(
+        "lucy-pro-t2v",
+        "lucy-pro-i2v",
+        "lucy-pro-v2v",
+        "lucy-2-v2v",
+        "lucy-fast-v2v",
+        "lucy-motion",
+        "lucy-dev-i2v",
+        "lucy-restyle-v2v",
+    ),
+)
+
+
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.VIDEO)
 
 
 class DecartVideoProvider(BaseProvider):
     """Provider adapter for Decart Lucy video generation.
 
-    Models: ``lucy-pro-t2v``, ``lucy-pro-i2v``, ``lucy-dev-i2v``, etc.
+    Models match the ``decart-lucy-video`` family — any ``lucy-`` slug
+    ending in ``2v``, ``motion``, or carrying ``restyle``.
 
     Auth: Set DECART_API_KEY env var or pass api_key.
 
@@ -87,13 +102,24 @@ class DecartVideoProvider(BaseProvider):
         poll_interval: Seconds between job status polls (default 5).
         output_dir: Directory for output files (default system temp).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL (no-op for
+            ``DiscoverySupport.NONE`` but accepted for API uniformity).
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "decart"
+    discovery_support = DiscoverySupport.NONE
+    """Decart has no ``GET /v1/models`` endpoint and the decart SDK
+    doesn't expose raw HTTP. The catalog is small and stable —
+    submit-time errors are the authoritative liveness signal."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        return ModelRegistry(defaults={mid: _video_spec(mid) for mid in _VIDEO_MODELS})
+        return ModelRegistry(
+            provider_families=(_DECART_LUCY_VIDEO_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Decart Lucy: video generation from text and image prompts."""
@@ -114,8 +140,15 @@ class DecartVideoProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._api_key = api_key
         self._output_dir = Path(output_dir) if output_dir else None

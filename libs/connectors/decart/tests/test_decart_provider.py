@@ -96,8 +96,10 @@ def test_fetch_output_failed_raises(mock_video_provider):
         provider.fetch_output("job-abc", step)
 
 
-def test_video_cost_tracked(mock_video_provider):
-    """Video cost is set based on resolution."""
+def test_video_cost_none_by_default(mock_video_provider):
+    """As of genblaze-core 0.3.0 the SDK ships zero hardcoded prices.
+    Decart users register pricing via ``register_pricing()``; see
+    ``docs/reference/pricing-recipes.md``."""
     provider, _ = mock_video_provider
     step = Step(
         provider="decart",
@@ -106,7 +108,27 @@ def test_video_cost_tracked(mock_video_provider):
         params={"resolution": "720p"},
     )
     result = provider.fetch_output("job-abc", step)
-    assert result.cost_usd is not None
+    assert result.cost_usd is None
+
+
+def test_video_cost_tracked_with_user_registered_pricing(mock_video_provider):
+    """User-registered ``by_param`` pricing keyed on resolution flows
+    through compute_cost — demonstrates the canonical Decart recipe."""
+    from genblaze_core.providers import by_param
+
+    rates = {"480p": 0.04, "720p": 0.08}
+    provider, _ = mock_video_provider
+    provider._models = provider.models.fork()
+    provider.models.register_pricing(
+        "lucy-pro-t2v", by_param("resolution", rates, default=rates["480p"])
+    )
+    step = Step(
+        provider="decart",
+        model="lucy-pro-t2v",
+        prompt="a sunset",
+        params={"resolution": "720p"},
+    )
+    result = provider.fetch_output("job-abc", step)
     assert result.cost_usd == 0.08
 
 
@@ -133,9 +155,21 @@ def test_image_generate_returns_asset(mock_image_provider):
     assert result.assets[0].url.startswith("file://")
 
 
-def test_image_cost_tracked(mock_image_provider):
-    """Image cost is flat rate."""
+def test_image_cost_none_by_default(mock_image_provider):
+    """SDK no longer ships pricing for Decart image as of 0.3.0."""
     provider, _ = mock_image_provider
+    step = Step(provider="decart-image", model="lucy-pro-t2i", prompt="a cat")
+    result = provider.generate(step)
+    assert result.cost_usd is None
+
+
+def test_image_cost_tracked_with_user_registered_pricing(mock_image_provider):
+    """User-registered flat per_unit pricing flows through compute_cost."""
+    from genblaze_core.providers import per_unit
+
+    provider, _ = mock_image_provider
+    provider._models = provider.models.fork()
+    provider.models.register_pricing("lucy-pro-t2i", per_unit(0.02))
     step = Step(provider="decart-image", model="lucy-pro-t2i", prompt="a cat")
     result = provider.generate(step)
     assert result.cost_usd == 0.02
@@ -169,6 +203,9 @@ def test_backward_compat_import(mock_decart_mod):
 class TestDecartVideoCompliance(ProviderComplianceTests):
     """Verify DecartVideoProvider satisfies the genblaze provider contract."""
 
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
+
     @pytest.fixture(autouse=True)
     def _patch_sdk(self, mock_decart_mod):
         with patch.dict("sys.modules", {"decart": mock_decart_mod}):
@@ -191,6 +228,9 @@ class TestDecartVideoCompliance(ProviderComplianceTests):
 
 class TestDecartImageCompliance(ProviderComplianceTests):
     """Verify DecartImageProvider satisfies the genblaze provider contract."""
+
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
 
     @pytest.fixture(autouse=True)
     def _patch_sdk(self, mock_decart_mod):

@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for the empty-payload probe pattern, so submit-time errors are the
     authoritative liveness signal. Pricing tables removed; recipe
     published at `docs/reference/pricing-recipes.md`.
+  - **decart** — `DiscoverySupport.NONE` for both video and image
+    providers. Two families: `decart-lucy-video` (pattern absorbs
+    `^lucy-.*(?:2v|motion|restyle)`) and `decart-lucy-image`
+    (`^lucy-.*2i$`). Cross-modality isolation guarded by tests so video
+    slugs don't leak into the image registry and vice versa. Pricing
+    removed; recipe published.
 
 ### Fixed — F-2026-05-04-01 (NVIDIA `nvidia/riva-tts` 404)
 

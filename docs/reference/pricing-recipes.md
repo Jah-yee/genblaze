@@ -316,10 +316,58 @@ ship.
 
 ---
 
+## Decart
+
+**Source:** module-level constants `_VIDEO_PRICING: dict[str, float]` (keyed
+by resolution) in `genblaze_decart/provider.py` and `_IMAGE_PRICE = 0.02`
+in `genblaze_decart/image.py` prior to `genblaze-core 0.3.0`.
+**Snapshot date:** 2026-05-05.
+**Verify at:** [docs.platform.decart.ai](https://docs.platform.decart.ai/).
+
+Decart Lucy bills per-generation, with video pricing keyed off the
+`resolution` parameter (480p vs 720p) and image pricing flat across
+all variants.
+
+```python
+from genblaze_core.providers import by_param, per_unit
+from genblaze_decart import DecartImageProvider, DecartVideoProvider
+
+# --- Video (USD/asset, keyed by resolution) ---
+DECART_VIDEO_RATES: dict = {"480p": 0.04, "720p": 0.08}
+
+video = DecartVideoProvider(api_key="...")
+for slug in (
+    "lucy-pro-t2v",
+    "lucy-pro-i2v",
+    "lucy-pro-v2v",
+    "lucy-2-v2v",
+    "lucy-fast-v2v",
+    "lucy-motion",
+    "lucy-dev-i2v",
+    "lucy-restyle-v2v",
+):
+    video.models.register_pricing(
+        slug,
+        by_param("resolution", DECART_VIDEO_RATES, default=DECART_VIDEO_RATES["480p"]),
+    )
+
+# --- Image (flat USD/asset) ---
+DECART_IMAGE_PRICE = 0.02
+
+image = DecartImageProvider(api_key="...")
+for slug in ("lucy-pro-t2i", "lucy-pro-i2i"):
+    image.models.register_pricing(slug, per_unit(DECART_IMAGE_PRICE))
+```
+
+Future Lucy variants match the family pattern automatically but won't
+have rates in this recipe — extend the dicts and re-register as new
+slugs ship.
+
+---
+
 <!--
   Subsequent connectors append their sections here as they migrate:
     - nvidia (chat / generative)
-    - decart
     - elevenlabs
     - openai
     - google
