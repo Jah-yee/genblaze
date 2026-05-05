@@ -122,6 +122,9 @@ def test_api_error_raises_provider_error(mock_tts):
 class TestOpenAITTSCompliance(ProviderComplianceTests):
     """Verify OpenAITTSProvider satisfies the genblaze provider contract."""
 
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
+
     @pytest.fixture(autouse=True)
     def _patch_sdk(self):
         with patch.dict("sys.modules", {"openai": MagicMock()}):

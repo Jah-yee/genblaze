@@ -87,8 +87,11 @@ def test_api_error_raises_provider_error(mock_dalle):
 # --- Cost tracking ---
 
 
-def test_cost_tracked_dalle3_standard(mock_dalle):
-    """Cost computed for DALL-E 3 standard quality at 1024x1024."""
+def test_cost_none_by_default(mock_dalle):
+    """As of genblaze-core 0.3.0 the SDK ships zero hardcoded prices for
+    OpenAI image models. Users register pricing via
+    ``provider.models.register_pricing()``; see
+    ``docs/reference/pricing-recipes.md`` for the canonical recipe."""
     provider, _ = mock_dalle
     step = Step(
         provider="openai-dalle",
@@ -97,20 +100,38 @@ def test_cost_tracked_dalle3_standard(mock_dalle):
         params={"quality": "standard", "size": "1024x1024"},
     )
     result = provider.generate(step)
-    assert result.cost_usd == pytest.approx(0.040)
+    assert result.cost_usd is None
 
 
-def test_cost_tracked_dalle3_hd(mock_dalle):
-    """Cost computed for DALL-E 3 HD quality at 1792x1024."""
+def test_cost_tracked_with_user_registered_tiered_pricing(mock_dalle):
+    """User-registered ``tiered`` pricing keyed on (quality, size)
+    flows through compute_cost — the canonical OpenAI image recipe."""
+    from genblaze_core.providers import tiered
+
     provider, _ = mock_dalle
-    step = Step(
-        provider="openai-dalle",
-        model="dall-e-3",
-        prompt="test",
-        params={"quality": "hd", "size": "1792x1024"},
-    )
-    result = provider.generate(step)
-    assert result.cost_usd == pytest.approx(0.120)
+    rates = {
+        ("standard", "1024x1024"): 0.040,
+        ("standard", "1024x1792"): 0.080,
+        ("standard", "1792x1024"): 0.080,
+        ("hd", "1024x1024"): 0.080,
+        ("hd", "1024x1792"): 0.120,
+        ("hd", "1792x1024"): 0.120,
+    }
+
+    def key(ctx):
+        params = ctx.step.params
+        return (params.get("quality", "standard"), params.get("size", "1024x1024"))
+
+    provider._models = provider.models.fork()
+    provider.models.register_pricing("dall-e-3", tiered(rates, key=key))
+
+    for params, expected in (
+        ({"quality": "standard", "size": "1024x1024"}, 0.040),
+        ({"quality": "hd", "size": "1792x1024"}, 0.120),
+    ):
+        step = Step(provider="openai-dalle", model="dall-e-3", prompt="test", params=params)
+        result = provider.generate(step)
+        assert result.cost_usd == pytest.approx(expected), params
 
 
 def test_cost_none_unknown_model(mock_dalle):
@@ -465,8 +486,37 @@ def test_unknown_model_passes_through(mock_b64_dalle):
         ("gpt-image-1-mini", "high", "1536x1024", 0.052),
     ],
 )
-def test_pricing_new_models(mock_b64_dalle, model, quality, size, expected):
+def test_user_registered_pricing_for_gpt_image_variants(
+    mock_b64_dalle, model, quality, size, expected
+):
+    """User-registered ``tiered`` pricing keyed on ``(quality, size)``
+    flows through compute_cost for any gpt-image variant. Demonstrates
+    the canonical recipe for the GPT-image lineup."""
+    from genblaze_core.providers import tiered
+
+    rates_per_model: dict = {
+        "gpt-image-1.5": {
+            ("low", "1024x1024"): 0.009,
+            ("medium", "1536x1024"): 0.050,
+            ("high", "1024x1536"): 0.200,
+        },
+        "gpt-image-1-mini": {
+            ("low", "1024x1024"): 0.005,
+            ("high", "1536x1024"): 0.052,
+        },
+    }
+
+    def make_key():
+        def _key(ctx):
+            params = ctx.step.params
+            return (params.get("quality"), params.get("size"))
+
+        return _key
+
     provider, _, _ = mock_b64_dalle
+    provider._models = provider.models.fork()
+    provider.models.register_pricing(model, tiered(rates_per_model[model], key=make_key()))
+
     step = Step(
         provider="openai-dalle",
         model=model,
@@ -477,8 +527,9 @@ def test_pricing_new_models(mock_b64_dalle, model, quality, size, expected):
     assert result.cost_usd == pytest.approx(expected)
 
 
-def test_gpt_image_2_pricing_none(mock_b64_dalle):
-    """gpt-image-2 pricing undisclosed → cost_usd stays None."""
+def test_gpt_image_2_pricing_none_by_default(mock_b64_dalle):
+    """gpt-image-2 has no published rates and the SDK ships none.
+    cost_usd stays None unless the user registers pricing."""
     provider, _, _ = mock_b64_dalle
     step = Step(
         provider="openai-dalle",
@@ -495,6 +546,9 @@ def test_gpt_image_2_pricing_none(mock_b64_dalle):
 
 class TestDalleCompliance(ProviderComplianceTests):
     """Verify DalleProvider satisfies the genblaze provider contract."""
+
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
 
     @pytest.fixture(autouse=True)
     def _patch_sdk(self):

@@ -2,9 +2,14 @@
 
 Synchronous API: POST /v1/audio/speech returns audio bytes directly.
 
-Models, pricing, and parameter handling are driven by the ``ModelRegistry``
-returned from ``create_registry()``. Per-1M-character pricing per model tier
-is declared on the spec; users can override via ``models=`` kwarg.
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships a
+pattern-keyed ``ModelFamily`` plus ``DiscoverySupport.NATIVE`` discovery
+via ``client.models.list()`` (filtered to TTS-shaped slugs).
+
+**Pricing**: previously hardcoded as per-1M-character rates per tier
+(tts-1: $15/M, tts-1-hd: $30/M, gpt-4o-mini-tts: $12/M). As of 0.3.0
+the SDK no longer ships pricing — see ``docs/reference/pricing-recipes.md``
+for the canonical recipe.
 
 Docs: https://platform.openai.com/docs/api-reference/audio/createSpeech
 """
@@ -12,6 +17,7 @@ Docs: https://platform.openai.com/docs/api-reference/audio/createSpeech
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,15 +28,18 @@ from genblaze_core.models.asset import Asset, AudioMetadata
 from genblaze_core.models.enums import Modality
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
+    DiscoveryResult,
+    DiscoverySupport,
     EnumSchema,
     FloatSchema,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
     SyncProvider,
-    per_input_chars,
 )
+from genblaze_core.providers.discovery import DEFAULT_TTL_SECONDS, _DiscoveryCache
 from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
@@ -62,27 +71,30 @@ _FORMAT_TO_MIME = {
     "pcm": "audio/pcm",
 }
 
-# Per-1M character pricing by model (USD)
-_TTS_PER_1M_RATES: dict[str, float] = {
-    "tts-1": 15.00,
-    "tts-1-hd": 30.00,
-    "gpt-4o-mini-tts": 12.00,
-}
-
-
-def _tts_spec(model_id: str, rate_per_1m: float) -> ModelSpec:
-    """Per-model spec — per-1M-character pricing on ``step.prompt``."""
-    return ModelSpec(
-        model_id=model_id,
+# OpenAI TTS family — covers tts-1, tts-1-hd, gpt-4o-mini-tts, and any
+# future TTS-named slug (gpt-4o-tts, gpt-5-mini-tts, etc.). The pattern
+# matches both the legacy ``tts-`` prefix and the ``gpt-*-tts`` shape
+# OpenAI's mid-2025 audio models adopted. Voice / response_format /
+# speed validation rides on the family spec_template.
+_OPENAI_TTS_FAMILY = ModelFamily(
+    name="openai-tts",
+    pattern=re.compile(r"^(?:tts-|gpt-.+-tts)"),
+    spec_template=ModelSpec(
+        model_id="*",
         modality=Modality.AUDIO,
-        pricing=per_input_chars(rate_per_1m, per=1_000_000),
         param_coercers={"speed": float},
         param_schemas={
             "voice": EnumSchema(values=_VALID_VOICES),
             "response_format": EnumSchema(values=_VALID_RESPONSE_FORMATS),
             "speed": FloatSchema(min=0.25, max=4.0),
         },
-    )
+    ),
+    description="OpenAI TTS family — tts-* and gpt-*-tts variants.",
+    example_slugs=("tts-1", "tts-1-hd", "gpt-4o-mini-tts"),
+)
+
+
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.AUDIO)
 
 
 class OpenAITTSProvider(SyncProvider):
@@ -103,11 +115,17 @@ class OpenAITTSProvider(SyncProvider):
     """
 
     name = "openai-tts"
+    discovery_support = DiscoverySupport.NATIVE
+    """OpenAI exposes ``client.models.list()`` as the authoritative
+    catalog. The fetcher filters to TTS-shaped slugs so chat / image /
+    Sora slugs don't pollute the cache."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        defaults = {mid: _tts_spec(mid, rate) for mid, rate in _TTS_PER_1M_RATES.items()}
-        return ModelRegistry(defaults=defaults)
+        return ModelRegistry(
+            provider_families=(_OPENAI_TTS_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """OpenAI TTS: audio speech generation from text."""
@@ -126,12 +144,55 @@ class OpenAITTSProvider(SyncProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._http_timeout = http_timeout
         self._output_dir = Path(output_dir) if output_dir else None
         self._client: Any = None
+        # Wire NATIVE discovery — fetcher closes over self.
+        self._models._discovery_cache = _DiscoveryCache(
+            self._fetch_models,
+            default_max_age_seconds=DEFAULT_TTL_SECONDS,
+        )
+
+    # --- catalog discovery (DiscoverySupport.NATIVE) ----------------------
+
+    def _fetch_models(self) -> DiscoveryResult:
+        """Fetch /v1/models, filter to TTS-shaped slugs."""
+        try:
+            client = self._get_client()
+            response = client.models.list()
+            slugs: set[str] = set()
+            for model in response.data:
+                mid = getattr(model, "id", None)
+                if isinstance(mid, str) and self._models.match_family(mid) is not None:
+                    slugs.add(mid)
+            return DiscoveryResult.ok(slugs, source_url="https://api.openai.com/v1/models")
+        except Exception as exc:
+            return DiscoveryResult.failed(
+                f"OpenAI models.list() failed: {exc}",
+                source_url="https://api.openai.com/v1/models",
+            )
+
+    def discover_models(
+        self,
+        *,
+        max_age_seconds: float | None = ...,  # type: ignore[assignment]
+    ) -> DiscoveryResult:
+        """Snapshot the TTS-filtered OpenAI catalog. Single-flight, TTL-bounded."""
+        cache = self._models._discovery_cache
+        assert cache is not None  # wired in __init__
+        if max_age_seconds is ...:  # type: ignore[comparison-overlap]
+            return cache.get()
+        return cache.get(max_age_seconds=max_age_seconds)
 
     def _get_client(self):
         if self._client is None:

@@ -3,8 +3,19 @@
 Supports OpenAI's full image model lineup: ``gpt-image-2``, ``gpt-image-1.5``,
 ``gpt-image-1``, ``gpt-image-1-mini``, ``dall-e-3``, ``dall-e-2``. Unknown /
 alias models (e.g. ``chatgpt-image-latest``, dated snapshots) pass through
-with ``cost_usd=None`` per the GMICloud "unknown models pass through"
-convention.
+with ``cost_usd=None``.
+
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships two
+pattern-keyed ``ModelFamily`` rules (gpt-image and dall-e) plus
+``DiscoverySupport.NATIVE`` discovery via ``client.models.list()``
+(filtered to image-shaped slugs).
+
+**Pricing**: previously a complex ``(quality, size) → USD`` table per
+model variant. As of 0.3.0 the SDK no longer ships pricing — see
+``docs/reference/pricing-recipes.md`` for the canonical recipe. The
+per-model ``_MODELS`` config below remains as connector-internal
+validation state (size enums, quality enums, fixed_sizes, response
+format) but no longer carries pricing.
 
 Routing is driven by ``step.inputs`` presence: inputs → ``/images/edits``,
 no inputs → ``/images/generations``. OpenAI is the authority for
@@ -24,12 +35,12 @@ import base64
 import contextlib
 import logging
 import os
+import re
 import tempfile
 import urllib.request
-from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 from urllib.parse import quote, unquote, urlparse
 
 from genblaze_core._utils import check_ssrf
@@ -38,15 +49,18 @@ from genblaze_core.models.asset import Asset
 from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
+    DiscoveryResult,
+    DiscoverySupport,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
     SyncProvider,
-    tiered,
     validate_asset_url,
     validate_chain_input_url,
 )
+from genblaze_core.providers.discovery import DEFAULT_TTL_SECONDS, _DiscoveryCache
 from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
@@ -79,18 +93,22 @@ _MAX_INPUT_BYTES = 50 * 1024 * 1024  # 50 MB — matches OpenAI's own edit limit
 
 @dataclass(frozen=True)
 class _ImageModelSpec:
-    """Per-model registry entry. Drives structural validation and cost.
+    """Per-model connector-internal validation config.
 
-    ``supports_input_fidelity`` is advisory — a mismatch emits a warning and
-    still forwards the param. The server is the authority for capability
-    rejection.
+    Drives the bespoke ``_validate_params`` logic for size/quality enums
+    and the response-format dispatch (b64_json vs CDN URL). Pricing
+    moved to ``docs/reference/pricing-recipes.md`` as of
+    ``genblaze-core 0.3.0``.
+
+    ``supports_input_fidelity`` is advisory — a mismatch emits a warning
+    and still forwards the param. The server is the authority for
+    capability rejection.
     """
 
     response_format: Literal["b64_json", "url"]
     valid_qualities: frozenset[str]
     fixed_sizes: frozenset[str] | None  # None => free-form (gpt-image-2)
     supports_input_fidelity: bool
-    pricing: dict[tuple[str, str], float] | None
 
 
 # Permissive fallback for unknown/alias models (chatgpt-image-latest, snapshots).
@@ -99,25 +117,7 @@ _DEFAULT_SPEC = _ImageModelSpec(
     valid_qualities=_GPT_QUALITIES,
     fixed_sizes=None,
     supports_input_fidelity=True,
-    pricing=None,
 )
-
-
-def _dalle_pricing(table: dict[tuple[str, str], float]):
-    """Tiered pricing keyed by (quality, size) with sensible defaults."""
-
-    def _key(ctx):
-        params = ctx.step.params
-        quality = params.get("quality")
-        size = params.get("size", "1024x1024")
-        if quality is None:
-            # Default: prefer "auto" if present in the table, else "standard"
-            quality = "auto" if ("auto", size) in table else "standard"
-        return (quality, size)
-
-    # Mapping is invariant in its key type; cast widens dict[tuple[str, str], ...]
-    # to the tuple[Hashable, ...] shape `tiered` accepts.
-    return tiered(cast(Mapping[tuple[Hashable, ...], float], table), key=_key)
 
 
 _MODELS: dict[str, _ImageModelSpec] = {
@@ -126,110 +126,78 @@ _MODELS: dict[str, _ImageModelSpec] = {
         valid_qualities=_GPT_QUALITIES,
         fixed_sizes=None,  # free-form; see _validate_gpt_image_2_size
         supports_input_fidelity=False,  # native HF — param is no-op server-side
-        pricing=None,  # TODO(pricing): set when OpenAI discloses per-image rates
     ),
     "gpt-image-1.5": _ImageModelSpec(
         response_format="b64_json",
         valid_qualities=_GPT_QUALITIES,
         fixed_sizes=_GPT_IMAGE_FIXED_SIZES,
         supports_input_fidelity=True,
-        pricing={
-            ("low", "1024x1024"): 0.009,
-            ("low", "1024x1536"): 0.013,
-            ("low", "1536x1024"): 0.013,
-            ("low", "auto"): 0.009,
-            ("medium", "1024x1024"): 0.034,
-            ("medium", "1024x1536"): 0.050,
-            ("medium", "1536x1024"): 0.050,
-            ("medium", "auto"): 0.034,
-            ("high", "1024x1024"): 0.133,
-            ("high", "1024x1536"): 0.200,
-            ("high", "1536x1024"): 0.200,
-            ("high", "auto"): 0.133,
-        },
     ),
     "gpt-image-1": _ImageModelSpec(
         response_format="b64_json",
         valid_qualities=_GPT_QUALITIES,
         fixed_sizes=_GPT_IMAGE_FIXED_SIZES,
         supports_input_fidelity=True,
-        pricing={
-            ("low", "1024x1024"): 0.011,
-            ("low", "1024x1536"): 0.016,
-            ("low", "1536x1024"): 0.016,
-            ("low", "auto"): 0.011,
-            ("medium", "1024x1024"): 0.042,
-            ("medium", "1024x1536"): 0.063,
-            ("medium", "1536x1024"): 0.063,
-            ("medium", "auto"): 0.042,
-            ("high", "1024x1024"): 0.167,
-            ("high", "1024x1536"): 0.250,
-            ("high", "1536x1024"): 0.250,
-            ("high", "auto"): 0.167,
-        },
     ),
     "gpt-image-1-mini": _ImageModelSpec(
         response_format="b64_json",
         valid_qualities=_GPT_QUALITIES,
         fixed_sizes=_GPT_IMAGE_FIXED_SIZES,
         supports_input_fidelity=False,  # per openai-python SDK reference
-        pricing={
-            ("low", "1024x1024"): 0.005,
-            ("low", "1024x1536"): 0.006,
-            ("low", "1536x1024"): 0.006,
-            ("low", "auto"): 0.005,
-            ("medium", "1024x1024"): 0.011,
-            ("medium", "1024x1536"): 0.015,
-            ("medium", "1536x1024"): 0.015,
-            ("medium", "auto"): 0.011,
-            ("high", "1024x1024"): 0.036,
-            ("high", "1024x1536"): 0.052,
-            ("high", "1536x1024"): 0.052,
-            ("high", "auto"): 0.036,
-        },
     ),
     "dall-e-3": _ImageModelSpec(
         response_format="url",
         valid_qualities=_DALLE3_QUALITIES,
         fixed_sizes=_DALLE3_SIZES,
         supports_input_fidelity=False,
-        pricing={
-            ("standard", "1024x1024"): 0.040,
-            ("standard", "1024x1792"): 0.080,
-            ("standard", "1792x1024"): 0.080,
-            ("hd", "1024x1024"): 0.080,
-            ("hd", "1024x1792"): 0.120,
-            ("hd", "1792x1024"): 0.120,
-        },
     ),
     "dall-e-2": _ImageModelSpec(
         response_format="url",
         valid_qualities=_DALLE2_QUALITIES,
         fixed_sizes=_DALLE2_SIZES,
         supports_input_fidelity=False,
-        pricing={
-            ("standard", "256x256"): 0.016,
-            ("standard", "512x512"): 0.018,
-            ("standard", "1024x1024"): 0.020,
-        },
     ),
 }
 
 
-def _build_dalle_registry() -> ModelRegistry:
-    """Expose models + pricing to the registry for user overrides.
+# Two families: gpt-image-* and dall-e-*. Both share the IMAGE modality
+# but ship different param-shape contracts (size enum, response format)
+# enforced by ``_validate_params`` against ``_MODELS[model_id]`` at submit
+# time. Family-level constraints are intentionally absent — the bespoke
+# validation in ``_validate_params`` owns them.
+_OPENAI_GPT_IMAGE_FAMILY = ModelFamily(
+    name="openai-gpt-image",
+    pattern=re.compile(r"^gpt-image-"),
+    spec_template=ModelSpec(model_id="*", modality=Modality.IMAGE),
+    description="OpenAI gpt-image-* family — latest image generation models.",
+    example_slugs=("gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-2"),
+)
 
-    Parameter validation stays connector-side (free-form size rules for
-    gpt-image-2, advisory input_fidelity warnings) — see ``_validate_params``.
-    The registry surfaces:
-    - Which models the connector knows (for capability discovery).
-    - Per-model pricing as a ``tiered()`` strategy users can override.
+_OPENAI_DALLE_FAMILY = ModelFamily(
+    name="openai-dalle",
+    pattern=re.compile(r"^dall-e-"),
+    spec_template=ModelSpec(model_id="*", modality=Modality.IMAGE),
+    description="OpenAI DALL-E family (legacy) — dall-e-2 and dall-e-3.",
+    example_slugs=("dall-e-2", "dall-e-3"),
+)
+
+
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.IMAGE)
+
+
+def _build_dalle_registry() -> ModelRegistry:
+    """Build the registry with two families covering the OpenAI image surface.
+
+    Parameter validation stays connector-side via ``_validate_params``
+    (free-form size rules for gpt-image-2, advisory input_fidelity
+    warnings). The registry surfaces:
+    - Which slugs the connector handles (for capability discovery).
+    - NATIVE-discovery integration via ``client.models.list()``.
     """
-    defaults: dict[str, ModelSpec] = {}
-    for model_id, spec in _MODELS.items():
-        pricing = _dalle_pricing(spec.pricing) if spec.pricing else None
-        defaults[model_id] = ModelSpec(model_id=model_id, pricing=pricing)
-    return ModelRegistry(defaults=defaults)
+    return ModelRegistry(
+        provider_families=(_OPENAI_GPT_IMAGE_FAMILY, _OPENAI_DALLE_FAMILY),
+        fallback=_FALLBACK,
+    )
 
 
 # --- Validation --------------------------------------------------------------
@@ -406,6 +374,11 @@ class DalleProvider(SyncProvider):
     """
 
     name = "openai-dalle"
+    discovery_support = DiscoverySupport.NATIVE
+    """OpenAI exposes ``client.models.list()`` as the authoritative
+    catalog. The fetcher filters to image-shaped slugs (``gpt-image-*``
+    and ``dall-e-*``) so chat / TTS / Sora slugs don't pollute the
+    DALL-E provider's cache."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
@@ -428,12 +401,55 @@ class DalleProvider(SyncProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._http_timeout = http_timeout
         self._output_dir = Path(output_dir) if output_dir else None
         self._client: Any = None
+        # Wire NATIVE discovery — fetcher closes over self.
+        self._models._discovery_cache = _DiscoveryCache(
+            self._fetch_models,
+            default_max_age_seconds=DEFAULT_TTL_SECONDS,
+        )
+
+    # --- catalog discovery (DiscoverySupport.NATIVE) ----------------------
+
+    def _fetch_models(self) -> DiscoveryResult:
+        """Fetch /v1/models, filter to image-shaped slugs."""
+        try:
+            client = self._get_client()
+            response = client.models.list()
+            slugs: set[str] = set()
+            for model in response.data:
+                mid = getattr(model, "id", None)
+                if isinstance(mid, str) and self._models.match_family(mid) is not None:
+                    slugs.add(mid)
+            return DiscoveryResult.ok(slugs, source_url="https://api.openai.com/v1/models")
+        except Exception as exc:
+            return DiscoveryResult.failed(
+                f"OpenAI models.list() failed: {exc}",
+                source_url="https://api.openai.com/v1/models",
+            )
+
+    def discover_models(
+        self,
+        *,
+        max_age_seconds: float | None = ...,  # type: ignore[assignment]
+    ) -> DiscoveryResult:
+        """Snapshot the image-filtered OpenAI catalog. Single-flight, TTL-bounded."""
+        cache = self._models._discovery_cache
+        assert cache is not None  # wired in __init__
+        if max_age_seconds is ...:  # type: ignore[comparison-overlap]
+            return cache.get()
+        return cache.get(max_age_seconds=max_age_seconds)
 
     def _get_client(self):
         if self._client is None:

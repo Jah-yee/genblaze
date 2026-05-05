@@ -508,7 +508,7 @@ Per the audit performed for this plan:
 | `google` | enumerated | `per_unit`, custom | `PARTIAL` | yes |
 | `lmnt` | already empty + fallback | `per_input_chars` | `NONE` | no |
 | `luma` | enumerated | `None` | `PARTIAL` | yes |
-| `openai` | enumerated | `per_input_chars`, `None` | `NATIVE` | n/a |
+| `openai` | ~~enumerated~~ → families (TTS, GPT-Image, DALL-E, Sora) | ~~`per_input_chars`, tiered, `None`~~ → recipe (Sora stays None — per-second formula) | `NATIVE` (PR #9) | n/a |
 | `replicate` | already empty + fallback | `per_response_metric` | `NATIVE` | n/a |
 | `runway` | enumerated | `by_model_and_param` | `NONE` (revised from `PARTIAL` during PR #6 — runwayml SDK doesn't expose raw HTTP for the empty-payload trick; small fixed catalog makes submit-time errors enough) | n/a |
 | `stability-audio` | single-model dict | `per_second` | `NONE` | no |

@@ -71,6 +71,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     may not enumerate SFX). TTS retired-slug verdicts surface as
     `NOT_FOUND` at preflight before any wire calls. Per-1K-char and
     duration-bucket pricing tables removed; recipes published.
+  - **openai** — TTS, DALL-E (gpt-image + dall-e), and Sora all declare
+    `DiscoverySupport.NATIVE` via `client.models.list()`. Each
+    provider's fetcher filters the global OpenAI catalog by its family
+    pattern, so chat / embeddings / Whisper slugs don't pollute
+    cross-modality caches. Two image families
+    (`openai-gpt-image` ^gpt-image-, `openai-dalle` ^dall-e-) keep the
+    bespoke `_validate_params` logic in the provider while the families
+    handle slug routing. Per-tier TTS pricing and per-(quality,size)
+    image pricing tables removed. Sora pricing remains None — the
+    correct formula is `(model, size, seconds)` per-second; a flat
+    table misreports 10x+. Standalone chat module out of scope (not a
+    Pipeline-Step provider).
 
 ### Fixed — F-2026-05-04-01 (NVIDIA `nvidia/riva-tts` 404)
 

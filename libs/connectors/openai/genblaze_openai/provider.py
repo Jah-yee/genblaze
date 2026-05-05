@@ -3,11 +3,15 @@
 Uses the asynchronous job-based Videos API:
   POST /v1/videos → poll GET /v1/videos/{id} → download content
 
-Models, parameter handling, and (future) pricing are driven by the
-``ModelRegistry`` returned from ``create_registry()``. Pricing is
-intentionally disabled — the correct formula requires ``(model, size,
-seconds)`` per-second billing and a flat per-video dict would misreport
-cost by 10x+ on longer clips.
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships a
+pattern-keyed ``ModelFamily`` plus ``DiscoverySupport.NATIVE`` discovery
+via ``client.models.list()`` (filtered to ``^sora-`` slugs).
+
+**Pricing**: still ``None`` — the correct formula requires
+``(model, size, seconds)`` per-second billing and a flat per-video dict
+would misreport cost by 10x+ on longer clips. Re-enable via
+``register_pricing()`` if a sound formula is available; see
+``docs/reference/pricing-recipes.md`` for the canonical guidance.
 
 Docs: https://platform.openai.com/docs/api-reference/videos
 """
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -26,6 +31,9 @@ from genblaze_core.models.asset import Asset, VideoMetadata
 from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
+    DiscoveryResult,
+    DiscoverySupport,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
@@ -33,6 +41,7 @@ from genblaze_core.providers import (
     route_images,
 )
 from genblaze_core.providers.base import BaseProvider
+from genblaze_core.providers.discovery import DEFAULT_TTL_SECONDS, _DiscoveryCache
 from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
@@ -114,45 +123,57 @@ def _validate_size(params: dict[str, Any]) -> None:
         )
 
 
-def _sora_spec(model_id: str) -> ModelSpec:
-    """Per-model spec for Sora.
-
-    Pricing is intentionally ``None`` — correct cost requires ``(model, size,
-    seconds)`` per-second billing; a flat dict misreports 10x+ on long clips.
-    Re-enable when the formula lands.
-    """
-    return ModelSpec(
-        model_id=model_id,
+# Single Sora family — covers sora-2, sora-2-pro, future variants.
+# Constraints (size enum, seconds enum) and the param transformer
+# (resolution+aspect_ratio → size, duration → seconds) ride on the
+# spec_template so every Sora slug inherits them automatically.
+_OPENAI_SORA_FAMILY = ModelFamily(
+    name="openai-sora",
+    pattern=re.compile(r"^sora-"),
+    spec_template=ModelSpec(
+        model_id="*",
         modality=Modality.VIDEO,
-        pricing=None,
         param_transformer=_sora_param_transformer,
         param_constraints=(_validate_seconds, _validate_size),
         # Route the first image asset to the native `image` slot for image-to-video.
         input_mapping=route_images(slots=("image",)),
-    )
+    ),
+    description="OpenAI Sora video family — sora-2, sora-2-pro, future variants.",
+    example_slugs=("sora-2", "sora-2-pro"),
+)
+
+
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.VIDEO)
 
 
 class SoraProvider(BaseProvider):
     """Provider adapter for OpenAI Sora video generation.
 
-    Models: ``sora-2`` (fast, default) and ``sora-2-pro`` (high quality).
+    Models match the ``openai-sora`` family — any ``^sora-`` slug.
 
     Args:
         api_key: OpenAI API key. Falls back to OPENAI_API_KEY env var.
         poll_interval: Seconds between status polls (default 5).
         http_timeout: HTTP request timeout in seconds (default 60).
+        output_dir: Directory for output files (default system temp).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL (no-op for NATIVE
+            but accepted for API uniformity).
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "openai-sora"
+    discovery_support = DiscoverySupport.NATIVE
+    """OpenAI exposes ``client.models.list()`` as the authoritative
+    catalog endpoint. The fetcher filters to family-matched slugs so
+    chat / image / TTS slugs don't pollute the Sora cache."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
         return ModelRegistry(
-            defaults={
-                "sora-2": _sora_spec("sora-2"),
-                "sora-2-pro": _sora_spec("sora-2-pro"),
-            }
+            provider_families=(_OPENAI_SORA_FAMILY,),
+            fallback=_FALLBACK,
         )
 
     def __init__(
@@ -164,13 +185,26 @@ class SoraProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._api_key = api_key
         self._http_timeout = http_timeout
         self._output_dir = Path(output_dir) if output_dir else None
         self._client: Any = None
+        # Wire NATIVE discovery — fetcher closes over self so it picks
+        # up the lazy-initialized openai client.
+        self._models._discovery_cache = _DiscoveryCache(
+            self._fetch_models,
+            default_max_age_seconds=DEFAULT_TTL_SECONDS,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Sora: video generation from text prompts."""
@@ -181,6 +215,44 @@ class SoraProvider(BaseProvider):
             models=self._models.known(),
             output_formats=["video/mp4"],
         )
+
+    # --- catalog discovery (DiscoverySupport.NATIVE) ----------------------
+
+    def _fetch_models(self) -> DiscoveryResult:
+        """Fetcher backing ``discover_models`` — calls /v1/models, filters to Sora.
+
+        OpenAI's ``models.list()`` returns the global catalog (chat,
+        embeddings, images, audio, video). We filter to slugs that
+        match the Sora family pattern so a user passing e.g. ``gpt-4o``
+        to Sora gets ``NOT_FOUND`` at preflight rather than a misleading
+        ``OK_AUTHORITATIVE`` from the cross-modality catalog.
+        """
+        try:
+            client = self._get_client()
+            response = client.models.list()
+            slugs: set[str] = set()
+            for model in response.data:
+                mid = getattr(model, "id", None)
+                if isinstance(mid, str) and self._models.match_family(mid) is not None:
+                    slugs.add(mid)
+            return DiscoveryResult.ok(slugs, source_url="https://api.openai.com/v1/models")
+        except Exception as exc:
+            return DiscoveryResult.failed(
+                f"OpenAI models.list() failed: {exc}",
+                source_url="https://api.openai.com/v1/models",
+            )
+
+    def discover_models(
+        self,
+        *,
+        max_age_seconds: float | None = ...,  # type: ignore[assignment]
+    ) -> DiscoveryResult:
+        """Snapshot the Sora-filtered OpenAI catalog. Single-flight, TTL-bounded."""
+        cache = self._models._discovery_cache
+        assert cache is not None  # wired in __init__
+        if max_age_seconds is ...:  # type: ignore[comparison-overlap]
+            return cache.get()
+        return cache.get(max_age_seconds=max_age_seconds)
 
     def _get_client(self):
         if self._client is None:

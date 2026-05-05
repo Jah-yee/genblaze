@@ -417,10 +417,103 @@ are live before registering rates against them.
 
 ---
 
+## OpenAI
+
+**Source:** `_TTS_PER_1M_RATES` in `genblaze_openai/tts.py` plus the
+per-model `pricing={(quality, size): rate}` tables in
+`genblaze_openai/dalle.py` prior to `genblaze-core 0.3.0`. Sora pricing
+was always `None` (correct formula requires per-second `(model, size,
+seconds)` billing; a flat dict misreports 10x+).
+**Snapshot date:** 2026-05-05.
+**Verify at:** [openai.com/pricing](https://openai.com/pricing).
+
+OpenAI bills three image-/audio-/video-generation surfaces with three
+different shapes:
+
+- **TTS**: per-1M-character rates per model tier.
+- **Image** (DALL-E + GPT-Image): tiered by `(quality, size)` per model.
+- **Sora** (video): per-second rates that depend on `(model, size,
+  seconds)`. **The SDK ships no Sora pricing recipe** because a flat
+  table can't represent the per-second formula honestly. Use the
+  upstream's published rate calculator until OpenAI exposes a stable
+  programmatic shape.
+
+```python
+from genblaze_core.providers import per_input_chars, tiered
+from genblaze_openai import DalleProvider, OpenAITTSProvider
+
+# --- TTS (USD per 1M input chars) ---
+OPENAI_TTS_RATES_PER_1M: dict[str, float] = {
+    "tts-1": 15.00,
+    "tts-1-hd": 30.00,
+    "gpt-4o-mini-tts": 12.00,
+}
+
+tts = OpenAITTSProvider(api_key="...")
+for slug, rate in OPENAI_TTS_RATES_PER_1M.items():
+    tts.models.register_pricing(slug, per_input_chars(rate, per=1_000_000))
+
+
+# --- Image (USD per generation, tiered by (quality, size)) ---
+def image_key(ctx):
+    p = ctx.step.params
+    quality = p.get("quality")
+    size = p.get("size", "1024x1024")
+    if quality is None:
+        # Prefer "auto" if the table has it, else "standard".
+        # (Caller can adjust the default per their workload.)
+        return ("standard", size)
+    return (quality, size)
+
+
+OPENAI_DALLE3_RATES: dict = {
+    ("standard", "1024x1024"): 0.040,
+    ("standard", "1024x1792"): 0.080,
+    ("standard", "1792x1024"): 0.080,
+    ("hd", "1024x1024"): 0.080,
+    ("hd", "1024x1792"): 0.120,
+    ("hd", "1792x1024"): 0.120,
+}
+
+OPENAI_DALLE2_RATES: dict = {
+    ("standard", "256x256"): 0.016,
+    ("standard", "512x512"): 0.018,
+    ("standard", "1024x1024"): 0.020,
+}
+
+OPENAI_GPT_IMAGE_1_RATES: dict = {
+    ("low", "1024x1024"): 0.011,
+    ("low", "1024x1536"): 0.016,
+    ("low", "1536x1024"): 0.016,
+    ("low", "auto"): 0.011,
+    ("medium", "1024x1024"): 0.042,
+    ("medium", "1024x1536"): 0.063,
+    ("medium", "1536x1024"): 0.063,
+    ("medium", "auto"): 0.042,
+    ("high", "1024x1024"): 0.167,
+    ("high", "1024x1536"): 0.250,
+    ("high", "1536x1024"): 0.250,
+    ("high", "auto"): 0.167,
+}
+
+# (Similar tables exist for gpt-image-1.5 and gpt-image-1-mini.
+# gpt-image-2 has no published rates — leave its pricing None.)
+
+dalle = DalleProvider(api_key="...")
+dalle.models.register_pricing("dall-e-3", tiered(OPENAI_DALLE3_RATES, key=image_key))
+dalle.models.register_pricing("dall-e-2", tiered(OPENAI_DALLE2_RATES, key=image_key))
+dalle.models.register_pricing("gpt-image-1", tiered(OPENAI_GPT_IMAGE_1_RATES, key=image_key))
+```
+
+OpenAI ships new image variants frequently. Match the family pattern
+via `provider.discover_models(refresh=True)`, then extend the rate
+tables and register the new slugs as they appear in the catalog.
+
+---
+
 <!--
   Subsequent connectors append their sections here as they migrate:
     - nvidia (chat / generative)
-    - openai
     - google
     - luma
     - stability-audio
