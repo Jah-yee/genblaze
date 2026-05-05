@@ -3,17 +3,29 @@
 Uses the lumaai Python SDK with async generation-based workflow:
   client.generations.create() → poll generation → get output URL
 
-Models, parameter handling, and chain-input routing are driven by the
-``ModelRegistry`` returned from ``create_registry()``. Pricing is
-intentionally disabled — Luma bills by duration, and a per-(model, duration)
-formula has not been implemented yet, so ``cost_usd`` stays ``None`` to avoid
-misreporting. See ``test_cost_not_populated_until_formula_lands``.
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships a
+pattern-keyed ``luma-ray`` family (``^ray-``) instead of a hardcoded
+slug list. New ``ray-N`` and ``ray-*-N`` slugs inherit the param
+shape automatically.
+
+**DiscoverySupport.NONE**: the lumaai SDK does not expose a
+``GET /models`` endpoint or any way to probe a slug without
+enqueuing a (billable) generation, so per-slug authoritative
+liveness is not achievable. Mirrors the Runway / Decart precedent —
+the small stable catalog plus submit-time errors are sufficient.
+
+**Pricing**: Luma bills by duration; a (model, duration) formula
+isn't shipped in the SDK. ``cost_usd`` stays ``None`` unless the
+user registers a pricing strategy via
+``provider.models.register_pricing(...)``. See
+``docs/reference/pricing-recipes.md`` for the canonical Luma recipe.
 
 Docs: https://docs.lumalabs.ai/
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from genblaze_core.exceptions import ProviderError
@@ -22,6 +34,8 @@ from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
     BaseProvider,
+    DiscoverySupport,
+    ModelFamily,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
@@ -57,28 +71,40 @@ def _coerce_loop(value: Any) -> bool:
     return bool(value)
 
 
-def _luma_spec(model_id: str) -> ModelSpec:
-    """Build the per-model spec.
-
-    Pricing is intentionally ``None`` — Luma bills by duration and the
-    formula isn't implemented yet. Re-enable when a (model, duration) rate
-    table lands; until then leaving this unset keeps ``cost_usd`` honest.
-    """
-    return ModelSpec(
-        model_id=model_id,
+_LUMA_RAY_FAMILY = ModelFamily(
+    name="luma-ray",
+    pattern=re.compile(r"^ray-"),
+    spec_template=ModelSpec(
+        model_id="*",
         modality=Modality.VIDEO,
-        pricing=None,
         param_coercers={"loop": _coerce_loop},
         param_constraints=(_check_aspect_ratio,),
         param_allowlist=_PARAM_ALLOWLIST,
         input_mapping=route_keyframes(frames=("frame0",)),
-    )
+    ),
+    description=(
+        "Luma Ray family — Dream Machine text/keyframe-conditioned video "
+        "generation. Covers ray-2, ray-flash-2, and future ray-N variants."
+    ),
+    example_slugs=("ray-2", "ray-flash-2"),
+)
+
+
+_FALLBACK = ModelSpec(
+    model_id="*",
+    modality=Modality.VIDEO,
+    param_coercers={"loop": _coerce_loop},
+    param_constraints=(_check_aspect_ratio,),
+    param_allowlist=_PARAM_ALLOWLIST,
+    input_mapping=route_keyframes(frames=("frame0",)),
+)
 
 
 class LumaProvider(BaseProvider):
     """Provider adapter for Luma Dream Machine video generation.
 
-    Models: ``ray-2`` (latest), ``ray-flash-2`` (fast).
+    Models match the ``luma-ray`` family (``^ray-``). Current
+    examples: ``ray-2``, ``ray-flash-2``.
 
     Auth: Set LUMAAI_API_KEY env var or pass auth_token.
 
@@ -86,14 +112,24 @@ class LumaProvider(BaseProvider):
         auth_token: Luma API key. Falls back to LUMAAI_API_KEY env var.
         poll_interval: Seconds between generation status polls (default 5).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL (no-op for NONE).
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "luma"
+    discovery_support = DiscoverySupport.NONE
+    """The lumaai SDK exposes no per-slug liveness probe that doesn't
+    enqueue a billable generation. Family-pattern resolution + a
+    small stable catalog plus submit-time errors are sufficient —
+    same call as Runway / Decart."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        defaults = {mid: _luma_spec(mid) for mid in ("ray-2", "ray-flash-2")}
-        return ModelRegistry(defaults=defaults)
+        return ModelRegistry(
+            provider_families=(_LUMA_RAY_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Luma: video generation from text or image prompts."""
@@ -112,8 +148,15 @@ class LumaProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._auth_token = auth_token
         self._client: Any = None

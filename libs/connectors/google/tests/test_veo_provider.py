@@ -166,8 +166,12 @@ def test_duration_alias(mock_google):
     client.models.generate_videos.assert_called_once()
 
 
-def test_cost_tracked(mock_google):
-    """Cost is set based on model and duration."""
+def test_cost_none_by_default(mock_google):
+    """As of genblaze-core 0.3.0 the SDK no longer ships pricing for Veo.
+    cost_usd is None unless the user has registered pricing via
+    ``provider.models.register_pricing()``. See
+    ``docs/reference/pricing-recipes.md`` for the canonical recipe.
+    """
     provider, client = mock_google
     step = Step(
         provider="google-veo",
@@ -179,12 +183,29 @@ def test_cost_tracked(mock_google):
     client.operations.get.return_value = _make_completed_operation()
     provider.poll(pred_id)
     result = provider.fetch_output(pred_id, step)
-    assert result.cost_usd == pytest.approx(0.35 * 6)
+    assert result.cost_usd is None
 
 
-def test_cost_tracked_duration_alias(mock_google):
-    """Cost uses the standard 'duration' alias."""
+def test_cost_tracked_with_user_registered_per_second(mock_google):
+    """User-registered per-second strategy reads duration_seconds from params."""
+    from genblaze_core.providers import PricingContext, PricingStrategy
+
+    def per_second(rate: float) -> PricingStrategy:
+        def _strategy(ctx: PricingContext) -> float | None:
+            raw = ctx.step.params.get("duration_seconds") or ctx.step.params.get("duration")
+            try:
+                dur = int(raw) if raw is not None else 4
+            except (TypeError, ValueError):
+                dur = 4
+            count = ctx.output_count or 1
+            return rate * dur * count
+
+        return _strategy
+
     provider, client = mock_google
+    provider._models = provider.models.fork()
+    provider.models.register_pricing("veo-3.0-generate-001", per_second(0.50))
+
     step = Step(
         provider="google-veo",
         model="veo-3.0-generate-001",
@@ -196,36 +217,6 @@ def test_cost_tracked_duration_alias(mock_google):
     provider.poll(pred_id)
     result = provider.fetch_output(pred_id, step)
     assert result.cost_usd == pytest.approx(0.50 * 8)
-
-
-def test_cost_default_duration(mock_google):
-    """Cost uses default 4s when no duration specified."""
-    provider, client = mock_google
-    step = Step(
-        provider="google-veo",
-        model="veo-2.0-generate-001",
-        prompt="a sunset",
-    )
-    pred_id = provider.submit(step)
-    client.operations.get.return_value = _make_completed_operation()
-    provider.poll(pred_id)
-    result = provider.fetch_output(pred_id, step)
-    assert result.cost_usd == pytest.approx(0.35 * 4)
-
-
-def test_cost_none_unknown_model(mock_google):
-    """Cost stays None for unknown model."""
-    provider, client = mock_google
-    step = Step(
-        provider="google-veo",
-        model="unknown-veo-model",
-        prompt="a sunset",
-    )
-    pred_id = provider.submit(step)
-    client.operations.get.return_value = _make_completed_operation()
-    provider.poll(pred_id)
-    result = provider.fetch_output(pred_id, step)
-    assert result.cost_usd is None
 
 
 def test_veo3_populates_tracks(mock_google):
@@ -287,6 +278,9 @@ def test_veo2_no_tracks(mock_google):
 
 class TestVeoCompliance(ProviderComplianceTests):
     """Verify VeoProvider satisfies the genblaze provider contract."""
+
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
 
     @pytest.fixture(autouse=True)
     def _patch_sdk(self):

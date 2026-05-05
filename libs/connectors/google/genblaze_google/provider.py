@@ -3,11 +3,14 @@
 Uses the google-genai SDK with the async operation-based workflow:
   client.models.generate_videos() → poll operation → download video
 
-Models, pricing, and parameter handling are driven by the ``ModelRegistry``
-returned from ``create_registry()``. Users can override pricing or register
-new models via::
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships the
+pattern-keyed ``google-veo`` family (``^veo-``) instead of a
+hardcoded slug list. New ``veo-N`` slugs inherit the param shape;
+authoritative liveness comes from ``client.models.get(model=slug)``
+via the family probe.
 
-    provider = VeoProvider(models=my_registry)
+**Pricing**: per-second-by-model rates were dropped in 0.3.0. See
+``docs/reference/pricing-recipes.md`` for the canonical Veo recipe.
 
 Docs: https://ai.google.dev/gemini-api/docs/video
 """
@@ -22,10 +25,10 @@ from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
     BaseProvider,
+    DiscoverySupport,
+    LiveProbeResult,
     ModelRegistry,
     ModelSpec,
-    PricingContext,
-    PricingStrategy,
     ProviderCapabilities,
     RetryPolicy,
     validate_asset_url,
@@ -34,95 +37,20 @@ from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
 from genblaze_google._errors import map_google_error
+from genblaze_google._families import GOOGLE_VEO_FAMILY
 
-# Valid Veo parameter values
-_VALID_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
-_VALID_RESOLUTIONS = frozenset({"720p", "1080p", "4k"})
-_VALID_DURATIONS = frozenset({"4", "6", "8"})
-
-# Per-second pricing by model (USD). Kept module-local so tests can monkey-patch
-# if needed; registry pricing strategies close over these values.
-_VEO_PER_SECOND_RATES: dict[str, float] = {
-    "veo-2.0-generate-001": 0.35,
-    "veo-3.0-generate-001": 0.50,
-    "veo-3.0-fast-generate-001": 0.25,
-}
-
-
-def _check_aspect_ratio(params: dict[str, Any]) -> None:
-    """Validate aspect_ratio with Veo-specific error wording."""
-    ar = params.get("aspect_ratio")
-    if ar is not None and ar not in _VALID_ASPECT_RATIOS:
-        raise ProviderError(
-            f"Invalid aspect_ratio={ar!r}. Must be one of {set(_VALID_ASPECT_RATIOS)}",
-            error_code=ProviderErrorCode.INVALID_INPUT,
-        )
-
-
-def _check_resolution(params: dict[str, Any]) -> None:
-    """Validate resolution with Veo-specific error wording."""
-    res = params.get("resolution")
-    if res is not None and res not in _VALID_RESOLUTIONS:
-        raise ProviderError(
-            f"Invalid resolution={res!r}. Must be one of {set(_VALID_RESOLUTIONS)}",
-            error_code=ProviderErrorCode.INVALID_INPUT,
-        )
-
-
-def _check_duration(params: dict[str, Any]) -> None:
-    """Validate duration_seconds with Veo-specific error wording (must be "4"/"6"/"8")."""
-    if "duration_seconds" not in params:
-        return
-    dur = params["duration_seconds"]
-    if dur not in _VALID_DURATIONS:
-        raise ProviderError(
-            f"Invalid duration_seconds={dur!r}. Must be one of {set(_VALID_DURATIONS)}",
-            error_code=ProviderErrorCode.INVALID_INPUT,
-        )
-
-
-def _per_second_by_model(rate: float) -> PricingStrategy:
-    """Per-second of requested duration × number of videos, at ``rate``.
-
-    Reads ``duration_seconds`` from params (string form — Veo native), falling
-    back to 4s when unspecified, and multiplies by the emitted asset count.
-    """
-
-    def _strategy(ctx: PricingContext) -> float | None:
-        raw = ctx.step.params.get("duration_seconds") or ctx.step.params.get("duration")
-        try:
-            dur = int(raw) if raw is not None else 4
-        except (TypeError, ValueError):
-            dur = 4
-        count = ctx.output_count or 1
-        return rate * dur * count
-
-    return _strategy
-
-
-def _veo_spec(model_id: str) -> ModelSpec:
-    """Build per-model spec. ``duration`` (canonical) → ``duration_seconds`` (native)."""
-    rate = _VEO_PER_SECOND_RATES.get(model_id)
-    pricing = _per_second_by_model(rate) if rate is not None else None
-    return ModelSpec(
-        model_id=model_id,
-        modality=Modality.VIDEO,
-        pricing=pricing,
-        param_aliases={"duration": "duration_seconds"},
-        # Coerce numeric duration to string (Veo native expects "4"/"6"/"8").
-        param_coercers={"duration_seconds": str},
-        # Validation via constraint callables so bespoke error wording is preserved.
-        param_constraints=(_check_aspect_ratio, _check_resolution, _check_duration),
-    )
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.VIDEO)
 
 
 class VeoProvider(BaseProvider):
     """Provider adapter for Google Veo video generation.
 
-    Models: ``veo-2.0-generate-001`` (stable), ``veo-3.0-generate-001`` (GA, audio),
-    ``veo-3.0-fast-generate-001`` (GA, fast).
+    Models match the ``google-veo`` family (``^veo-``). Current GA
+    examples: ``veo-2.0-generate-001``, ``veo-3.0-generate-001``,
+    ``veo-3.0-fast-generate-001``.
 
-    Supports both Gemini API (api_key) and Vertex AI (project/location) auth.
+    Supports both Gemini API (``api_key``) and Vertex AI
+    (``project``/``location``) auth.
 
     Args:
         api_key: Gemini API key. Falls back to GEMINI_API_KEY env var.
@@ -130,14 +58,24 @@ class VeoProvider(BaseProvider):
         location: GCP region for Vertex AI (default "us-central1").
         poll_interval: Seconds between operation polls (default 10).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL.
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "google-veo"
+    discovery_support = DiscoverySupport.PARTIAL
+    """google-genai has no per-modality catalog endpoint that filters
+    Veo cleanly. The family probe (``client.models.get``) is the
+    authoritative liveness check; preflight surfaces dead slugs as
+    ``NOT_FOUND`` before the operation submission."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        defaults = {mid: _veo_spec(mid) for mid in _VEO_PER_SECOND_RATES}
-        return ModelRegistry(defaults=defaults)
+        return ModelRegistry(
+            provider_families=(GOOGLE_VEO_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Veo: video generation from text prompts with configurable resolution and duration."""
@@ -159,13 +97,24 @@ class VeoProvider(BaseProvider):
         poll_interval: float = 10.0,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._api_key = api_key
         self._project = project
         self._location = location
         self._client: Any = None
+
+    def _invoke_family_probe(self, probe: Any, model_id: str) -> LiveProbeResult:
+        """Forward the family probe with this provider's lazy genai client."""
+        return probe(model_id, client=self._get_client())
 
     def normalize_params(self, params: dict, modality: Any = None) -> dict:
         """Map standard params to Veo-native names.

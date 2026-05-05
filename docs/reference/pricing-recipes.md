@@ -511,10 +511,130 @@ tables and register the new slugs as they appear in the catalog.
 
 ---
 
+## Google
+
+**Source:** `_VEO_PER_SECOND_RATES` in `genblaze_google/provider.py` and
+`_IMAGEN_PER_IMAGE_RATES` in `genblaze_google/imagen.py` prior to
+`genblaze-core 0.3.0`. Standalone `genblaze_google.chat()` retains its
+own per-token table — chat is out of scope for the catalog-decoupling
+effort because it isn't a Pipeline-Step provider.
+**Snapshot date:** 2026-05-05.
+**Verify at:** [ai.google.dev/pricing](https://ai.google.dev/pricing)
+and [cloud.google.com/vertex-ai/generative-ai/pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing).
+
+Veo bills per-second of generated video — multiply the rate by the
+requested `duration_seconds` and the number of returned clips.
+Imagen bills flat per-image.
+
+```python
+from genblaze_core.providers import PricingContext, PricingStrategy, per_unit
+from genblaze_google import ImagenProvider, VeoProvider
+
+# --- Veo (USD per second of generated video) ---
+VEO_PER_SECOND_RATES: dict[str, float] = {
+    "veo-2.0-generate-001": 0.35,
+    "veo-3.0-generate-001": 0.50,
+    "veo-3.0-fast-generate-001": 0.25,
+}
+
+
+def per_second_by_model(rate: float) -> PricingStrategy:
+    """Per-second of requested duration × asset count.
+
+    Reads ``duration_seconds`` from ``step.params`` (Veo native, string
+    form), falling back to ``duration`` (canonical alias), then to 4s.
+    """
+
+    def _strategy(ctx: PricingContext) -> float | None:
+        raw = ctx.step.params.get("duration_seconds") or ctx.step.params.get("duration")
+        try:
+            dur = int(raw) if raw is not None else 4
+        except (TypeError, ValueError):
+            dur = 4
+        count = ctx.output_count or 1
+        return rate * dur * count
+
+    return _strategy
+
+
+veo = VeoProvider(api_key="...")
+for slug, rate in VEO_PER_SECOND_RATES.items():
+    veo.models.register_pricing(slug, per_second_by_model(rate))
+
+
+# --- Imagen (flat USD per generated image) ---
+IMAGEN_PER_IMAGE_RATES: dict[str, float] = {
+    "imagen-3.0-generate-002": 0.04,
+    "imagen-3.0-fast-generate-001": 0.02,
+}
+
+imagen = ImagenProvider(api_key="...")
+for slug, rate in IMAGEN_PER_IMAGE_RATES.items():
+    imagen.models.register_pricing(slug, per_unit(rate))
+```
+
+Future `veo-N` and `imagen-N` slugs match the family patterns
+automatically; extend the rate dictionaries and re-register as new
+models ship. `client.models.get(slug)` is the authoritative liveness
+check — preflight surfaces dead/unauthorized slugs as `NOT_FOUND`
+before submission.
+
+---
+
+## Luma
+
+**Source:** never shipped — Luma bills by duration and the SDK
+intentionally left ``cost_usd`` ``None`` rather than misreport with a
+flat per-generation rate. The recipe below documents the formula so
+users opting into cost tracking can register it themselves.
+**Snapshot date:** 2026-05-05.
+**Verify at:** [lumalabs.ai/pricing](https://lumalabs.ai/dream-machine/pricing).
+
+Luma generations bill per-second of generated video. ``duration`` is
+typically passed as a string (e.g. ``"5s"``) on Luma's API; the
+strategy strips a trailing ``s`` defensively.
+
+```python
+from genblaze_core.providers import PricingContext, PricingStrategy
+from genblaze_luma import LumaProvider
+
+# (model → USD per second). Sample rates — verify against your billing.
+LUMA_PER_SECOND_RATES: dict[str, float] = {
+    "ray-2": 0.40,
+    "ray-flash-2": 0.20,
+}
+
+
+def per_second_by_model(rate: float) -> PricingStrategy:
+    def _strategy(ctx: PricingContext) -> float | None:
+        raw = ctx.step.params.get("duration")
+        if isinstance(raw, str) and raw.endswith("s"):
+            raw = raw[:-1]
+        try:
+            dur = int(raw) if raw is not None else 5
+        except (TypeError, ValueError):
+            dur = 5
+        count = ctx.output_count or 1
+        return rate * dur * count
+
+    return _strategy
+
+
+luma = LumaProvider(auth_token="...")
+for slug, rate in LUMA_PER_SECOND_RATES.items():
+    luma.models.register_pricing(slug, per_second_by_model(rate))
+```
+
+Future ``ray-N`` slugs match the family pattern automatically; extend
+the rate dictionary and re-register as new models ship. The lumaai
+SDK exposes no per-slug liveness probe that doesn't enqueue a
+billable generation, so unknown slugs surface at submission time
+rather than at preflight.
+
+---
+
 <!--
   Subsequent connectors append their sections here as they migrate:
     - nvidia (chat / generative)
-    - google
-    - luma
     - stability-audio
 -->

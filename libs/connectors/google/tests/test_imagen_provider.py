@@ -138,6 +138,9 @@ def test_api_error_raises_provider_error(mock_imagen):
 class TestImagenCompliance(ProviderComplianceTests):
     """Verify ImagenProvider satisfies the genblaze provider contract."""
 
+    # SDK no longer ships pricing as of genblaze-core 0.3.0.
+    expects_cost = False
+
     @pytest.fixture(autouse=True)
     def _patch_sdk(self):
         mock_types = MagicMock()

@@ -2,11 +2,15 @@
 
 Synchronous API: client.models.generate_images() returns images directly.
 
-Models, pricing, and parameter handling are driven by the ``ModelRegistry``
-returned from ``create_registry()``. Users can override pricing or register
-new models via::
+**Catalog architecture (genblaze-core 0.3.0):** the SDK ships the
+pattern-keyed ``google-imagen`` family (``^imagen-``) instead of a
+hardcoded slug list. Authoritative liveness comes from
+``client.models.get(model=slug)`` via the family probe, so dead /
+unauthorized slugs surface at preflight rather than mid-call.
 
-    provider = ImagenProvider(models=my_registry)
+**Pricing**: per-image-by-model rates were dropped in 0.3.0. See
+``docs/reference/pricing-recipes.md`` for the canonical Imagen
+recipe.
 
 Docs: https://ai.google.dev/gemini-api/docs/image-generation
 """
@@ -24,53 +28,28 @@ from genblaze_core.models.asset import Asset
 from genblaze_core.models.enums import Modality, ProviderErrorCode
 from genblaze_core.models.step import Step
 from genblaze_core.providers import (
+    DiscoverySupport,
+    LiveProbeResult,
     ModelRegistry,
     ModelSpec,
     ProviderCapabilities,
     RetryPolicy,
     SyncProvider,
-    per_unit,
 )
 from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
 from genblaze_google._errors import map_google_error
+from genblaze_google._families import GOOGLE_IMAGEN_FAMILY
 
-_VALID_ASPECT_RATIOS = frozenset({"1:1", "3:4", "4:3", "9:16", "16:9"})
-
-# Per-image pricing by model (USD). Captured here once; the specs wrap these
-# in ``per_unit`` pricing strategies.
-_IMAGEN_PER_IMAGE_RATES: dict[str, float] = {
-    "imagen-3.0-generate-002": 0.04,
-    "imagen-3.0-fast-generate-001": 0.02,
-}
-
-
-def _check_aspect_ratio(params: dict[str, Any]) -> None:
-    """Validate aspect_ratio with Imagen-specific error wording."""
-    ar = params.get("aspect_ratio")
-    if ar is not None and ar not in _VALID_ASPECT_RATIOS:
-        raise ProviderError(
-            f"Invalid aspect_ratio={ar!r}. Must be one of {_VALID_ASPECT_RATIOS}",
-            error_code=ProviderErrorCode.INVALID_INPUT,
-        )
-
-
-def _imagen_spec(model_id: str) -> ModelSpec:
-    """Per-model spec — flat per-image pricing, aspect_ratio validation."""
-    rate = _IMAGEN_PER_IMAGE_RATES.get(model_id)
-    return ModelSpec(
-        model_id=model_id,
-        modality=Modality.IMAGE,
-        pricing=per_unit(rate) if rate is not None else None,
-        param_constraints=(_check_aspect_ratio,),
-    )
+_FALLBACK = ModelSpec(model_id="*", modality=Modality.IMAGE)
 
 
 class ImagenProvider(SyncProvider):
     """Provider adapter for Google Imagen image generation.
 
-    Models: ``imagen-3.0-generate-002`` (latest), ``imagen-3.0-fast-generate-001``.
+    Models match the ``google-imagen`` family (``^imagen-``). Current
+    examples: ``imagen-3.0-generate-002``, ``imagen-3.0-fast-generate-001``.
 
     Imagen returns image bytes directly (synchronous, not operation-based).
     Output is saved to files; use ObjectStorageSink for cloud upload.
@@ -81,14 +60,24 @@ class ImagenProvider(SyncProvider):
         location: GCP region for Vertex AI (default "us-central1").
         output_dir: Directory for output image files (default system temp).
         models: Optional custom ``ModelRegistry`` — overrides the class default.
+        retry_policy: Optional retry policy override.
+        probe_cache_ttl: Per-instance probe-cache TTL.
+        probe_cache_max_entries: Per-instance probe-cache size cap.
     """
 
     name = "google-imagen"
+    discovery_support = DiscoverySupport.PARTIAL
+    """google-genai exposes ``client.models.get`` per-slug; that's the
+    authoritative liveness signal. There's no Imagen-only catalog
+    listing endpoint, so we stay PARTIAL and rely on the family
+    probe."""
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        defaults = {mid: _imagen_spec(mid) for mid in _IMAGEN_PER_IMAGE_RATES}
-        return ModelRegistry(defaults=defaults)
+        return ModelRegistry(
+            provider_families=(GOOGLE_IMAGEN_FAMILY,),
+            fallback=_FALLBACK,
+        )
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Imagen: image generation from text prompts."""
@@ -108,13 +97,24 @@ class ImagenProvider(SyncProvider):
         output_dir: str | Path | None = None,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._project = project
         self._location = location
         self._output_dir = Path(output_dir) if output_dir else None
         self._client: Any = None
+
+    def _invoke_family_probe(self, probe: Any, model_id: str) -> LiveProbeResult:
+        """Forward the family probe with this provider's lazy genai client."""
+        return probe(model_id, client=self._get_client())
 
     def _get_client(self):
         if self._client is None:

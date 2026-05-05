@@ -83,6 +83,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     correct formula is `(model, size, seconds)` per-second; a flat
     table misreports 10x+. Standalone chat module out of scope (not a
     Pipeline-Step provider).
+  - **google** — Veo (`^veo-`) and Imagen (`^imagen-`) now ship as
+    pattern-keyed families with `DiscoverySupport.PARTIAL`. Liveness
+    is confirmed via `client.models.get(model=slug)` — the canonical
+    "is this model available to my project?" lookup — so dead /
+    unauthorized slugs surface as `NOT_FOUND` at preflight without
+    enqueuing a generation. Per-second Veo and per-image Imagen
+    pricing tables removed; recipes published. Standalone Gemini
+    `chat()` retains its per-token table (out of scope — not a
+    Pipeline-Step provider).
+  - **luma** — single `^ray-` family covers `ray-2`, `ray-flash-2`,
+    and future `ray-N` / `ray-*-N` variants. Reclassified from
+    `PARTIAL` to `DiscoverySupport.NONE` during implementation: the
+    lumaai SDK exposes no per-slug probe that doesn't enqueue a
+    billable generation, and the upstream catalog is small and
+    stable (mirrors the Runway / Decart precedent). Luma was
+    already pricing-None — the recipe documents the canonical
+    per-second-by-model strategy for users who want cost
+    attribution.
 
 ### Fixed — F-2026-05-04-01 (NVIDIA `nvidia/riva-tts` 404)
 

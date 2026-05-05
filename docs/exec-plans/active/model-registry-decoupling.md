@@ -505,9 +505,9 @@ Per the audit performed for this plan:
 | `gmicloud` | catalog with `suspected_dead` | per-slug `per_unit` | `PARTIAL` | yes — empty-payload POST |
 | `decart` | ~~`_IMAGE_MODELS`, `_VIDEO_MODELS`~~ → families | ~~`per_unit`, `by_param`~~ → recipe | `NONE` (PR #7) | no |
 | `elevenlabs` | ~~enumerated voices/sfx~~ → families | ~~`per_input_chars`, `bucketed`~~ → recipe | TTS = `NATIVE` (`client.models.get_all()`); SFX = `NONE` (PR #8) | n/a |
-| `google` | enumerated | `per_unit`, custom | `PARTIAL` | yes |
+| `google` | ~~enumerated~~ → families (Veo `^veo-`, Imagen `^imagen-`) | ~~`per_unit`, per-second~~ → recipe | `PARTIAL` (PR #10 — `client.models.get` probe) | yes — `client.models.get(slug)` |
 | `lmnt` | already empty + fallback | `per_input_chars` | `NONE` | no |
-| `luma` | enumerated | `None` | `PARTIAL` | yes |
+| `luma` | ~~enumerated~~ → families (`^ray-`) | `None` (recipe published) | `NONE` (revised from `PARTIAL` during PR #11 — lumaai SDK exposes no per-slug probe that doesn't enqueue a billable generation; small fixed catalog mirrors Runway / Decart precedent) | n/a |
 | `openai` | ~~enumerated~~ → families (TTS, GPT-Image, DALL-E, Sora) | ~~`per_input_chars`, tiered, `None`~~ → recipe (Sora stays None — per-second formula) | `NATIVE` (PR #9) | n/a |
 | `replicate` | already empty + fallback | `per_response_metric` | `NATIVE` | n/a |
 | `runway` | enumerated | `by_model_and_param` | `NONE` (revised from `PARTIAL` during PR #6 — runwayml SDK doesn't expose raw HTTP for the empty-payload trick; small fixed catalog makes submit-time errors enough) | n/a |
