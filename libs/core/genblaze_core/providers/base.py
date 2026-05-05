@@ -289,7 +289,26 @@ class BaseProvider(Runnable[Step, Step]):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ) -> None:
+        """
+        Args:
+            models: Per-instance ``ModelRegistry`` override. ``None`` uses
+                the class-level default from ``models_default()``.
+            retry_policy: Per-instance retry policy. ``None`` builds a
+                policy from ``self.poll_transient_retries``.
+            probe_cache_ttl: Per-instance TTL (seconds) for the
+                family-probe result cache. ``None`` uses the class-level
+                ``PROBE_CACHE_TTL_SECONDS`` (3600). Set higher in
+                production for stable upstreams; lower in staging where
+                slug churn is faster. Configurable per-instance to avoid
+                process-global class-attribute mutation.
+            probe_cache_max_entries: Per-instance cap on probe-cache
+                size before FIFO eviction kicks in. ``None`` uses the
+                class-level ``PROBE_CACHE_MAX_ENTRIES`` (256). Raise for
+                providers with very large catalogs.
+        """
         # Poll result cache — avoids redundant API calls between poll() and fetch_output()
         self._poll_cache: dict[str, Any] = {}
         self._poll_cache_times: dict[str, float] = {}
@@ -336,6 +355,17 @@ class BaseProvider(Runnable[Step, Step]):
         # operator's mental model of "model existence is stable for ~hours".
         self._probe_cache: dict[str, tuple[float, LiveProbeResult]] = {}
         self._probe_cache_lock: threading.RLock = threading.RLock()
+        # Per-instance config: fall back to class-level constants when
+        # the kwarg is None so subclasses can still tune via class-attr
+        # override.
+        self._probe_cache_ttl: float = (
+            probe_cache_ttl if probe_cache_ttl is not None else type(self).PROBE_CACHE_TTL_SECONDS
+        )
+        self._probe_cache_max_entries: int = (
+            probe_cache_max_entries
+            if probe_cache_max_entries is not None
+            else type(self).PROBE_CACHE_MAX_ENTRIES
+        )
         # In-flight probe events keyed by slug; entry exists while a
         # probe is mid-flight, gets removed once the result is cached.
         self._probe_inflight: dict[str, threading.Event] = {}
@@ -536,11 +566,28 @@ class BaseProvider(Runnable[Step, Step]):
                 cache = self._models._discovery_cache
                 if cache is not None:
                     cache.invalidate()
+            discovery_failed = False
             try:
                 self.discover_models()
             except Exception as exc:
                 logger.warning("discover_models raised during validate_model: %s", exc)
-            return self._models.validate(model_id, discovery_support=self.discovery_support)
+                discovery_failed = True
+            result = self._models.validate(model_id, discovery_support=self.discovery_support)
+            # When the in-band fetch failed, the validation answer was
+            # computed against whatever was in the cache (potentially
+            # stale, possibly empty). Annotate ``detail`` so operators
+            # correlating logs during an upstream incident know the
+            # signal quality is degraded — without this hint, an
+            # ``OK_AUTHORITATIVE`` from ``DISCOVERY`` looks identical to
+            # one from a fresh fetch.
+            if discovery_failed:
+                from dataclasses import replace
+
+                result = replace(
+                    result,
+                    detail=("discovery fetch failed; result is from stale or empty cache"),
+                )
+            return result
 
         # PARTIAL / NONE: if a family probe is configured, consult it.
         # Goes through _cached_probe so repeated validate_model() calls
@@ -623,7 +670,7 @@ class BaseProvider(Runnable[Step, Step]):
                 cached = self._probe_cache.get(model_id)
                 if cached is not None:
                     fetched_at, result = cached
-                    if (time.monotonic() - fetched_at) <= self.PROBE_CACHE_TTL_SECONDS:
+                    if (time.monotonic() - fetched_at) <= self._probe_cache_ttl:
                         return result
                     # Expired — evict; we'll repopulate after the probe.
                     del self._probe_cache[model_id]
@@ -684,7 +731,7 @@ class BaseProvider(Runnable[Step, Step]):
         entries in one pass to amortize eviction cost — checking on
         every write would amplify lock-hold time on the hot path.
         """
-        if len(self._probe_cache) <= self.PROBE_CACHE_MAX_ENTRIES:
+        if len(self._probe_cache) <= self._probe_cache_max_entries:
             return
         # Drop oldest 25% (relies on dict insertion-order being
         # FIFO-coherent in Python 3.7+).
@@ -729,8 +776,8 @@ class BaseProvider(Runnable[Step, Step]):
         return ``SKIPPED`` to preserve the historical default.
         """
         warnings.warn(
-            "BaseProvider.probe_model() is deprecated; use validate_model() "
-            "instead. Removed in genblaze-core 0.4.0.",
+            "BaseProvider.probe_model() is deprecated since genblaze-core 0.3.0; "
+            "use validate_model() instead. Will be removed in genblaze-core 0.4.0.",
             DeprecationWarning,
             stacklevel=2,
         )

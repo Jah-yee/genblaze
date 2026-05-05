@@ -401,12 +401,14 @@ class TestProbeCache:
         assert all(r.outcome is ValidationOutcome.OK_AUTHORITATIVE for r in results)
 
     def test_cache_eviction_under_size_pressure(self) -> None:
-        """Cache stays bounded under PROBE_CACHE_MAX_ENTRIES — daemons
+        """Cache stays bounded under probe_cache_max_entries — daemons
         that see many distinct slugs don't grow the cache unbounded."""
         http = _http_with_status(400)
-        provider = GMICloudVideoProvider(api_key="test", http_client=http)
-        # Tighten the cap for the test so we don't have to send 256+ probes.
-        provider.PROBE_CACHE_MAX_ENTRIES = 8
+        # Tighten the cap via the constructor kwarg so the test doesn't
+        # have to fire 256+ probes to exercise eviction.
+        provider = GMICloudVideoProvider(
+            api_key="test", http_client=http, probe_cache_max_entries=8
+        )
         # Use family-matched slugs (Pixverse pattern). Exhaust the cap.
         for i in range(20):
             provider.validate_model(f"pixverse-v5.6-t2v-variant-{i}")

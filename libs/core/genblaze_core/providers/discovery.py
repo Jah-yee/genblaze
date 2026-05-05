@@ -155,6 +155,25 @@ class _DiscoveryCache:
         self._in_flight: bool = False
         self._event: threading.Event | None = None
 
+    def fork(self) -> _DiscoveryCache:
+        """Return a fresh cache wrapping the same fetcher.
+
+        Used by ``ModelRegistry.fork()`` so a forked registry doesn't
+        share cache state with its parent. Without this, a caller doing
+        ``forked.discover_models(refresh=True)`` would invalidate the
+        parent's (and every sibling fork's) cache via the shared
+        ``_DiscoveryCache`` instance — surprising in multi-tenant
+        deployments where each tenant gets a fork.
+
+        The fetcher closure is shared (it typically captures the
+        connector's http client / api key). Only the cache state is
+        independent.
+        """
+        return _DiscoveryCache(
+            self._fetcher,
+            default_max_age_seconds=self._default_ttl,
+        )
+
     def get(self, *, max_age_seconds: float | None = ...) -> DiscoveryResult:  # type: ignore[assignment]
         """Return a fresh-enough discovery snapshot, fetching if needed.
 

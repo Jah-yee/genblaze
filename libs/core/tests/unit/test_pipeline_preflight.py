@@ -110,6 +110,46 @@ class TestNotFoundRaises:
             pipe._validate_steps()
         assert "nvidia/magpie-tts-multilingual" in str(exc.value)
 
+    def test_error_message_includes_refresh_recovery_hint(self) -> None:
+        """The NOT_FOUND error must point users at the refresh=True
+        escape hatch — without it, a cached-DEAD verdict that no longer
+        reflects upstream reality strands the user with no recovery
+        path beyond reading the source."""
+        p = _make_native_provider({"live"})
+        pipe = Pipeline("t").step(p, model="dead-slug", modality=Modality.IMAGE, prompt="hi")
+        with pytest.raises(ProviderError) as exc:
+            pipe._validate_steps()
+        msg = str(exc.value)
+        assert "refresh=True" in msg, f"NOT_FOUND error must mention the refresh recovery: {msg}"
+
+    def test_error_message_propagates_validation_detail(self) -> None:
+        """When validate_model returns a NOT_FOUND with a ``detail``
+        (e.g., from a stale-cache fallback path), that detail must
+        surface in the user's exception so they can correlate during
+        incidents."""
+        # Construct a provider whose registry returns NOT_FOUND with
+        # a custom detail. We pass a stub directly via ``models=`` and
+        # mock the validate path.
+        from genblaze_core.providers.validation import (
+            ValidationOutcome,
+            ValidationResult,
+            ValidationSource,
+        )
+
+        p = _make_native_provider({"live"})
+
+        def _validate_with_detail(slug: str, *, refresh: bool = False) -> ValidationResult:
+            return ValidationResult.not_found(
+                ValidationSource.DISCOVERY,
+                detail="discovery fetch failed; result is from stale cache",
+            )
+
+        p.validate_model = _validate_with_detail  # type: ignore[method-assign]
+        pipe = Pipeline("t").step(p, model="any", modality=Modality.IMAGE, prompt="hi")
+        with pytest.raises(ProviderError) as exc:
+            pipe._validate_steps()
+        assert "stale cache" in str(exc.value)
+
 
 class TestOkAuthoritativeSilent:
     def test_native_present_slug_silent(self, caplog) -> None:

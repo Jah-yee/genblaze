@@ -267,11 +267,158 @@ class TestForkPreservesFamilies:
         assert match is not None
         assert match.family.name == "user"
 
-    def test_fork_carries_discovery_cache(self) -> None:
-        cache = _DiscoveryCache(lambda: DiscoveryResult.ok({"x"}))
+    def test_fork_isolates_discovery_cache(self) -> None:
+        """``fork()`` produces an independent discovery cache wrapping
+        the same fetcher closure. Without this isolation, a refresh on
+        one fork would invalidate the parent's (and every sibling
+        fork's) warm cache — surprising in multi-tenant deployments
+        that fork per tenant."""
+        fetcher_calls = [0]
+
+        def fetcher() -> DiscoveryResult:
+            fetcher_calls[0] += 1
+            return DiscoveryResult.ok({"x"})
+
+        cache = _DiscoveryCache(fetcher)
         reg = ModelRegistry(discovery_cache=cache)
+        # Warm the parent's cache.
+        reg._discovery_cache.get()
+        assert fetcher_calls[0] == 1
+
         fork = reg.fork()
-        # Same cache instance shared across fork — discovery snapshots
-        # are per-provider-instance, but fork() is a copy-on-write of
-        # specs, not a network surface.
-        assert fork._discovery_cache is cache
+        # Distinct cache instance — fork's state is independent.
+        assert fork._discovery_cache is not cache, "fork should not share the cache instance"
+        # Same fetcher closure, so the fork hits the same upstream.
+        # Fork's cache starts empty (no fetch yet).
+        assert fork._discovery_cache.peek() is None
+
+        # Invalidating the fork must NOT blow out the parent's cache.
+        fork._discovery_cache.invalidate()
+        parent_after = reg._discovery_cache.peek()
+        assert parent_after is not None, "parent cache must survive invalidation of a fork"
+
+
+class TestProbeCacheConfigurability:
+    """Per-instance probe-cache configuration via ``BaseProvider``
+    constructor kwargs. Replaces process-global class-attribute
+    mutation as the tuning knob."""
+
+    def _make_partial_provider(self, **kwargs: object):
+        """Build a minimal PARTIAL provider for cache-config tests."""
+        from genblaze_core.providers.base import BaseProvider, ProviderCapabilities
+
+        class _P(BaseProvider):
+            name = "test-partial"
+            discovery_support = DiscoverySupport.PARTIAL
+
+            def get_capabilities(self) -> ProviderCapabilities:
+                return ProviderCapabilities(supported_modalities=[Modality.IMAGE])
+
+            def submit(self, *a, **k):  # type: ignore[no-untyped-def]
+                return "pid"
+
+            def poll(self, *a, **k):  # type: ignore[no-untyped-def]
+                return True
+
+            def fetch_output(self, *a, **k):  # type: ignore[no-untyped-def]
+                return None
+
+        return _P(**kwargs)  # type: ignore[arg-type]
+
+    def test_default_falls_back_to_class_constants(self) -> None:
+        """When the kwargs are omitted, instance attrs adopt the class
+        constants. This preserves backwards compatibility for any
+        connector that hadn't been updated to forward the kwargs."""
+        from genblaze_core.providers.base import BaseProvider
+
+        provider = self._make_partial_provider()
+        assert provider._probe_cache_ttl == BaseProvider.PROBE_CACHE_TTL_SECONDS
+        assert provider._probe_cache_max_entries == BaseProvider.PROBE_CACHE_MAX_ENTRIES
+
+    def test_kwargs_override_class_constants(self) -> None:
+        """Explicit kwargs win and live as instance attrs — no class
+        mutation, so other instances of the same provider class keep
+        the default."""
+        provider = self._make_partial_provider(probe_cache_ttl=120.0, probe_cache_max_entries=16)
+        assert provider._probe_cache_ttl == 120.0
+        assert provider._probe_cache_max_entries == 16
+
+        # A second instance with defaults is unaffected.
+        baseline = self._make_partial_provider()
+        assert baseline._probe_cache_ttl != 120.0
+
+
+class TestDeprecationWarningAttribution:
+    """Fix verifying ``probe_model``'s deprecation warning carries
+    explicit version provenance so log aggregators can filter by it."""
+
+    def test_warning_text_includes_since_and_removal_versions(self) -> None:
+        """Without explicit ``since X.Y.Z`` and ``removed in W.Z.Y``,
+        log aggregation systems can't distinguish this deprecation
+        from any other and operators can't time their migrations."""
+        import warnings
+
+        from genblaze_core.providers.base import BaseProvider, ProviderCapabilities
+
+        class _P(BaseProvider):
+            name = "warn-test"
+            discovery_support = DiscoverySupport.NONE
+
+            def get_capabilities(self) -> ProviderCapabilities:
+                return ProviderCapabilities(supported_modalities=[Modality.IMAGE])
+
+            def submit(self, *a, **k):  # type: ignore[no-untyped-def]
+                return "pid"
+
+            def poll(self, *a, **k):  # type: ignore[no-untyped-def]
+                return True
+
+            def fetch_output(self, *a, **k):  # type: ignore[no-untyped-def]
+                return None
+
+        provider = _P()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            provider.probe_model("any-slug")
+
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert len(deprecations) == 1
+        msg = str(deprecations[0].message)
+        assert "since genblaze-core 0.3.0" in msg
+        assert "0.4.0" in msg
+
+
+class TestDiscoveryFailureSurfacesStaleHint:
+    """Fix verifying that when ``discover_models()`` raises during
+    ``validate_model``, the returned ``ValidationResult.detail``
+    carries a stale-cache hint so operators can correlate during
+    upstream incidents."""
+
+    def test_failed_discovery_marks_result_detail(self) -> None:
+        from genblaze_core.providers.base import BaseProvider, ProviderCapabilities
+
+        class _BrokenNative(BaseProvider):
+            name = "broken-native"
+            discovery_support = DiscoverySupport.NATIVE
+
+            def get_capabilities(self) -> ProviderCapabilities:
+                return ProviderCapabilities(supported_modalities=[Modality.IMAGE])
+
+            def discover_models(self, *, max_age_seconds: float | None = ...):  # type: ignore[assignment]
+                raise RuntimeError("upstream 500")
+
+            def submit(self, *a, **k):  # type: ignore[no-untyped-def]
+                return "pid"
+
+            def poll(self, *a, **k):  # type: ignore[no-untyped-def]
+                return True
+
+            def fetch_output(self, *a, **k):  # type: ignore[no-untyped-def]
+                return None
+
+        provider = _BrokenNative()
+        result = provider.validate_model("anything")
+        # The detail must mention the discovery failure so operators
+        # don't trust a permissive-fallback result during an outage.
+        assert result.detail is not None
+        assert "discovery fetch failed" in result.detail

@@ -567,9 +567,19 @@ class Pipeline(Runnable[None, PipelineResult]):
                 if result.suggested_slugs
                 else ""
             )
+            # Surface ``result.detail`` in the error so cached-DEAD
+            # verdicts and stale-cache hints reach the user's traceback.
+            # Operators investigating "why is preflight failing for a
+            # slug I just confirmed live?" need to see the cache-staleness
+            # signal here rather than tail the WARN logs separately.
+            detail = f" ({result.detail})" if result.detail else ""
+            recovery = (
+                " Try `provider.validate_model(slug, refresh=True)` "
+                "to re-probe if the cached verdict may be stale."
+            )
             raise ProviderError(
                 f"Step {i} ({ps.provider.name}): model {ps.model!r} not found "
-                f"in upstream catalog.{suggestions} "
+                f"in upstream catalog.{suggestions}{detail}{recovery} "
                 f"See docs/migration/registry-decoupling.md.",
                 error_code=ProviderErrorCode.MODEL_ERROR,
             )

@@ -194,7 +194,12 @@ class ModelRegistry:
                 defaults={**self._defaults, **self._user},
                 fallback=self._fallback,
                 provider_families=self._provider_families,
-                discovery_cache=self._discovery_cache,
+                # Fork the discovery cache rather than sharing by reference:
+                # a refresh on the clone must not blow out the parent's (or
+                # sibling forks') warm cache. The fetcher closure is shared,
+                # so the clone hits the same upstream with the same auth —
+                # only cache *state* is isolated.
+                discovery_cache=(self._discovery_cache.fork() if self._discovery_cache else None),
                 strict_params=self._strict,
                 # Pass the unioned set; the constructor will re-union with
                 # family.unstable_examples (idempotent — frozenset union).

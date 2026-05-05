@@ -142,10 +142,19 @@ class GMICloudBase(BaseProvider):
         http_client: httpx.Client | None = None,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
         # Forward models= to BaseProvider so the documented per-instance
         # registry override actually takes effect (closes feedback P0-03).
-        super().__init__(models=models, retry_policy=retry_policy)
+        # probe_cache_* kwargs let operators tune cache semantics per
+        # deployment without process-global class-attribute mutation.
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._api_key: str | None = api_key or os.environ.get("GMI_API_KEY")
         self._http_timeout = http_timeout
