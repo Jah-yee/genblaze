@@ -12,8 +12,9 @@ from abc import abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from genblaze_core._utils import _SECRET_PATTERNS, new_id, utc_now
 from genblaze_core.exceptions import ProviderError
@@ -180,20 +181,126 @@ def validate_asset_url(url: str) -> None:
 # Schemes allowed for chain inputs (file:// from local providers, https:// from cloud)
 _CHAIN_INPUT_SCHEMES = frozenset({"https", "file"})
 
+# Paths that resolve under any of these prefixes are rejected unconditionally.
+# Best-effort defense in depth — pipelines accepting user-controlled URLs
+# should additionally pass ``file_root_allowlist`` for strict containment.
+# Includes Linux + macOS canonical aliases and common container secrets paths.
+_FORBIDDEN_FILE_PATH_PREFIXES = (
+    "/proc/",
+    "/dev/",
+    "/sys/",
+    "/etc/",
+    "/private/etc/",  # macOS canonical alias for /etc
+    "/private/var/run/",  # macOS secrets path
+    "/run/secrets/",  # Linux container secrets (Docker / Kubernetes)
+    "/var/run/secrets/",  # alt Linux secrets path
+)
 
-def validate_chain_input_url(url: str) -> None:
-    """Validate a URL from step.inputs before forwarding to a provider.
 
-    Allows file:// (local chain outputs from SyncProviders) and https://
-    (cloud-hosted assets). Rejects http:// and other schemes.
+def validate_chain_input_url(
+    url: str,
+    *,
+    file_root_allowlist: tuple[Path, ...] = (),
+) -> None:
+    """Validate a URL from ``step.inputs`` before forwarding to a provider.
+
+    Allows ``https://`` (cloud-hosted assets) and ``file://`` (local
+    chain outputs from SyncProviders), with the constraints below.
+    Rejects ``http://`` and every other scheme.
+
+    ``file://`` validation is layered:
+
+    * **RFC 8089 netloc**: empty or ``localhost``; anything else is
+      treated as a remote-host reference and rejected.
+    * **Percent-decoding before traversal check**: ``urlparse`` leaves
+      ``%2F`` encoded, so a substring scan for ``..`` would miss
+      ``..%2Fetc%2Fpasswd``. ``unquote()`` is applied before
+      canonicalization.
+    * **Canonicalization via ``Path.resolve(strict=False)``**: collapses
+      ``..`` segments, follows symlinks, and resolves platform aliases
+      like ``/private/etc`` → ``/etc`` on macOS.
+    * **Denylist on the canonical path**: rejects ``/proc``, ``/dev``,
+      ``/sys``, ``/etc``, ``/private/etc``, ``/private/var/run``,
+      ``/run/secrets``, ``/var/run/secrets``. Best-effort and
+      non-exhaustive — Windows paths and platform-specific secrets
+      mounts are not covered. Production deployments accepting
+      user-controlled URLs **must** pass ``file_root_allowlist``.
+    * **Strict containment (opt-in)** via ``file_root_allowlist``: every
+      accepted path must resolve under one of the listed roots.
+      Symlinks resolve through; outside-root symlinks fail the check.
+
+    **Known limitations of default mode** (no allowlist):
+
+    * Multi-pass percent-encoding (``..%252F...``) is NOT collapsed by
+      single-pass ``unquote``. The literal ``%2F`` survives to the
+      resolved path; downstream consumers that decode again before
+      opening the file are responsible for their own validation.
+      Allowlist mode neutralizes this case.
+    * Platform-specific sensitive paths beyond the denylist (e.g.
+      ``C:\\Windows\\System32`` on Windows) — use the allowlist.
+
+    Args:
+        url: The URL to validate.
+        file_root_allowlist: Optional tuple of root directories. If
+            provided, ``file://`` URLs must resolve under one of these
+            roots after canonicalization. Recommended for any pipeline
+            that accepts user-supplied chain-input URLs.
+
+    Raises:
+        ProviderError(INVALID_INPUT) on any rejection.
     """
     parsed = urlparse(url)
     if parsed.scheme not in _CHAIN_INPUT_SCHEMES:
         raise ProviderError(
-            f"Unsafe chain input URL '{url}' — only HTTPS and file:// URLs allowed"
+            f"Unsafe chain input URL '{url}' — only HTTPS and file:// URLs allowed",
+            error_code=ProviderErrorCode.INVALID_INPUT,
         )
-    if parsed.scheme == "https" and not parsed.netloc:
-        raise ProviderError(f"Malformed HTTPS URL '{url}' — missing host")
+    if parsed.scheme == "https":
+        if not parsed.netloc:
+            raise ProviderError(
+                f"Malformed HTTPS URL '{url}' — missing host",
+                error_code=ProviderErrorCode.INVALID_INPUT,
+            )
+        return
+
+    # --- file:// path ---
+    # RFC 8089: empty or 'localhost' netloc; anything else is suspicious
+    # (file://remote-host/etc/passwd is always wrong).
+    if parsed.netloc and parsed.netloc != "localhost":
+        raise ProviderError(
+            f"file:// URL must have empty or 'localhost' netloc; got {parsed.netloc!r}",
+            error_code=ProviderErrorCode.INVALID_INPUT,
+        )
+
+    # Decode percent-encoded sequences BEFORE canonicalization so that
+    # ``file:///valid/path/..%2Fetc%2Fpasswd`` collapses correctly.
+    decoded_path = unquote(parsed.path)
+
+    if not decoded_path.startswith("/"):
+        raise ProviderError(
+            f"file:// URL requires an absolute path; got {decoded_path!r}",
+            error_code=ProviderErrorCode.INVALID_INPUT,
+        )
+
+    # Canonicalize through Path.resolve() to collapse '..', symlinks,
+    # and platform aliases (/private/etc → /etc on macOS) in one pass.
+    # strict=False so a path that doesn't yet exist (e.g. an output
+    # location validated before write) still validates.
+    canonical_str = str(Path(decoded_path).resolve(strict=False))
+
+    if any(canonical_str.startswith(p.rstrip("/")) for p in _FORBIDDEN_FILE_PATH_PREFIXES):
+        raise ProviderError(
+            f"file:// path resolves to a sensitive system location: {canonical_str}",
+            error_code=ProviderErrorCode.INVALID_INPUT,
+        )
+
+    if file_root_allowlist:
+        canonical = Path(canonical_str)
+        if not any(canonical.is_relative_to(root.resolve()) for root in file_root_allowlist):
+            raise ProviderError(
+                f"file:// path not under any allowlisted root: {canonical_str}",
+                error_code=ProviderErrorCode.INVALID_INPUT,
+            )
 
 
 class BaseProvider(Runnable[Step, Step]):
@@ -309,10 +416,17 @@ class BaseProvider(Runnable[Step, Step]):
                 class-level ``PROBE_CACHE_MAX_ENTRIES`` (256). Raise for
                 providers with very large catalogs.
         """
-        # Poll result cache — avoids redundant API calls between poll() and fetch_output()
+        # Poll result cache — avoids redundant API calls between poll() and fetch_output().
+        # ``_poll_cache_lock`` guards both dicts together: ``_get_cached_poll_result``
+        # does a read-then-pop pair that is not atomic without it. Multiple concurrent
+        # ``ainvoke()`` calls (which dispatch via ``asyncio.to_thread``) race on the same
+        # provider instance otherwise, and one caller can read ``None`` while another
+        # is still in the middle of pop'ing. ``threading.Lock`` (not RLock) is correct
+        # here — none of these methods re-enter each other; ``Lock`` is faster.
         self._poll_cache: dict[str, Any] = {}
         self._poll_cache_times: dict[str, float] = {}
         self._poll_cache_max_age: float = 3600.0  # 1 hour TTL
+        self._poll_cache_lock: threading.Lock = threading.Lock()
         # Use ``is not None`` rather than truthiness — ``ModelRegistry.__len__``
         # makes an empty registry falsy, so ``models or default`` would silently
         # discard explicit empty overrides (Replicate / LMNT have empty defaults).
@@ -413,30 +527,46 @@ class BaseProvider(Runnable[Step, Step]):
         return out
 
     def _cache_poll_result(self, prediction_id: Any, result: Any) -> None:
-        """Cache a poll result for reuse in fetch_output()."""
+        """Cache a poll result for reuse in fetch_output().
+
+        Thread-safe: concurrent calls (e.g. multiple ``ainvoke`` running
+        on the same provider via ``asyncio.to_thread``) acquire
+        ``_poll_cache_lock`` before mutating either dict.
+        """
         key = str(prediction_id)
-        self._poll_cache[key] = result
-        self._poll_cache_times[key] = time.monotonic()
+        with self._poll_cache_lock:
+            self._poll_cache[key] = result
+            self._poll_cache_times[key] = time.monotonic()
 
     def _get_cached_poll_result(self, prediction_id: Any) -> Any | None:
-        """Return cached poll result if available. Consumes the entry."""
+        """Return cached poll result if available. Consumes the entry.
+
+        Read-then-pop is performed under ``_poll_cache_lock`` so two
+        concurrent callers can't both observe the entry and race to
+        ``pop`` it (one would silently get ``None`` while the other got
+        the result, with no way to tell which won). With the lock,
+        exactly one caller wins.
+        """
         key = str(prediction_id)
-        result = self._poll_cache.pop(key, None)
-        self._poll_cache_times.pop(key, None)
+        with self._poll_cache_lock:
+            result = self._poll_cache.pop(key, None)
+            self._poll_cache_times.pop(key, None)
         return result
 
     def _cleanup_poll_cache(self) -> None:
-        """Remove poll cache entries older than TTL to prevent memory leaks."""
+        """Remove poll cache entries older than TTL to prevent memory leaks.
+
+        All read + delete operations happen inside ``_poll_cache_lock``
+        so a concurrent ``_cache_poll_result`` write can't change the
+        dict mid-scan ("dictionary changed size during iteration").
+        """
         now = time.monotonic()
         max_age = self._poll_cache_max_age
-        # Snapshot first — a concurrent poll() running in asyncio.to_thread
-        # can call _cache_poll_result mid-iteration and raise
-        # "RuntimeError: dictionary changed size during iteration".
-        snapshot = list(self._poll_cache_times.items())
-        stale = [k for k, t in snapshot if now - t > max_age]
-        for k in stale:
-            self._poll_cache.pop(k, None)
-            self._poll_cache_times.pop(k, None)
+        with self._poll_cache_lock:
+            stale = [k for k, t in self._poll_cache_times.items() if now - t > max_age]
+            for k in stale:
+                self._poll_cache.pop(k, None)
+                self._poll_cache_times.pop(k, None)
 
     @property
     def models(self) -> ModelRegistry:
@@ -669,9 +799,9 @@ class BaseProvider(Runnable[Step, Step]):
             if not refresh:
                 cached = self._probe_cache.get(model_id)
                 if cached is not None:
-                    fetched_at, result = cached
+                    fetched_at, cached_result = cached
                     if (time.monotonic() - fetched_at) <= self._probe_cache_ttl:
-                        return result
+                        return cached_result
                     # Expired — evict; we'll repopulate after the probe.
                     del self._probe_cache[model_id]
             else:
@@ -702,7 +832,23 @@ class BaseProvider(Runnable[Step, Step]):
             return LiveProbeResult.UNKNOWN
 
         # Phase 3 (elected fetcher): run the probe outside the lock,
-        # then update cache + signal waiters.
+        # then update cache + signal waiters in a guaranteed-cleanup
+        # finally block.
+        #
+        # The cleanup MUST run even on ``BaseException`` (KeyboardInterrupt,
+        # SystemExit, custom BaseException subclasses raised by tests).
+        # Without ``finally`` here, ``_probe_inflight[model_id]`` would
+        # leak permanently — every subsequent caller for that slug
+        # becomes a waiter on a dead Event and blocks for the full
+        # ``_PROBE_INFLIGHT_WAIT_SECONDS`` before falling through.
+        #
+        # Probe duration is bounded by the connector's own transport
+        # timeout (``httpx.Client(timeout=...)`` for HTTP probes,
+        # equivalent for SDK-based probes). The framework deliberately
+        # does NOT wrap the probe in a separate ``concurrent.futures``
+        # timeout — see the ``FamilyProbe`` contract docstring in
+        # ``family.py`` for why.
+        result: LiveProbeResult = LiveProbeResult.UNKNOWN
         try:
             result = self._invoke_family_probe(probe, model_id)
         except Exception as exc:
@@ -712,15 +858,15 @@ class BaseProvider(Runnable[Step, Step]):
                 exc,
             )
             result = LiveProbeResult.UNKNOWN
-
-        with self._probe_cache_lock:
-            event = self._probe_inflight.pop(model_id, None)
-            # Only cache definitive answers — UNKNOWN may be transient.
-            if result is not LiveProbeResult.UNKNOWN:
-                self._probe_cache[model_id] = (time.monotonic(), result)
-                self._evict_probe_cache_if_oversized()
-            if event is not None:
-                event.set()
+        finally:
+            with self._probe_cache_lock:
+                event = self._probe_inflight.pop(model_id, None)
+                # Only cache definitive answers — UNKNOWN may be transient.
+                if result is not LiveProbeResult.UNKNOWN:
+                    self._probe_cache[model_id] = (time.monotonic(), result)
+                    self._evict_probe_cache_if_oversized()
+                if event is not None:
+                    event.set()
 
         return result
 

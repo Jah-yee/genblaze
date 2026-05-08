@@ -443,6 +443,19 @@ def test_edit_mask_param_opens_file(mock_b64_dalle, tmp_path):
 
 
 def test_edit_file_url_outside_allowed_roots_rejected(mock_b64_dalle):
+    """A file:// chain input pointing at a sensitive system path must
+    be rejected. Two reject paths can fire here:
+    - ``validate_chain_input_url`` (called early on every chain input)
+      catches denylist hits like ``/etc/`` with "sensitive system
+      location" in the message.
+    - ``_resolve_local_file`` (DALL-E's own allowlist check) catches
+      paths outside the temp+output_dir roots with "outside allowed
+      directories".
+
+    Either path is correct; pin the test to "rejected" rather than a
+    specific message so the order of checks can change without
+    breaking the regression intent.
+    """
     provider, _, _ = mock_b64_dalle
     from genblaze_core.models.asset import Asset as _Asset
 
@@ -452,7 +465,9 @@ def test_edit_file_url_outside_allowed_roots_rejected(mock_b64_dalle):
         prompt="x",
         inputs=[_Asset(url="file:///etc/passwd", media_type="image/png")],
     )
-    with pytest.raises(ProviderError, match="outside allowed"):
+    # match= keeps the test honest: an unrelated ProviderError (missing
+    # API key, model lookup failure) won't pass this regression pin.
+    with pytest.raises(ProviderError, match=r"sensitive system|outside allowed"):
         provider.generate(step)
 
 

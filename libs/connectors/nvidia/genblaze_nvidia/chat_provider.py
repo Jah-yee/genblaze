@@ -104,8 +104,18 @@ class NvidiaChatProvider(SyncProvider):
         client: Any = None,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ) -> None:
-        super().__init__(models=models, retry_policy=retry_policy)
+        # probe_cache_* are no-ops on this NATIVE-discovery provider; accepted
+        # for API uniformity so calling code can pass them to any provider
+        # without TypeError.
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._base_url = base_url
         self._timeout = timeout

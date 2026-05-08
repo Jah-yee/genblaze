@@ -317,6 +317,57 @@ class ProviderComplianceTests(ABC):
         p2 = provider.normalize_params(dict(p1))
         assert p1 == p2, f"normalize_params not idempotent: {p1} != {p2}"
 
+    # --- API uniformity ---
+
+    def test_accepts_probe_cache_kwargs(self) -> None:
+        """Every Provider subclass must accept the probe-cache ctor kwargs.
+
+        These are no-ops on NATIVE / NONE providers but must be accepted
+        for API uniformity — calling code that passes them to ANY provider
+        must not raise ``TypeError``. Verified by **calling the
+        constructor** with the kwargs, not just inspecting the signature
+        — a ``**kwargs``-forwarding provider that doesn't actually
+        accept the names would pass an inspect-only check while still
+        failing here.
+        """
+        cls = type(self.make_provider())
+        # Build a fresh instance with the kwargs; if the provider rejects
+        # them with TypeError, the test fails with a clear message.
+        try:
+            cls(
+                **self.constructor_kwargs_for_probe_cache_test(),
+                probe_cache_ttl=120.0,
+                probe_cache_max_entries=64,
+            )
+        except TypeError as exc:
+            # Distinguish a probe-kwarg conformance failure from an
+            # unrelated TypeError (e.g. missing required ``api_key``,
+            # ``output_dir``, or another connector-specific arg). Only
+            # the former should fail this test with the conformance
+            # message; everything else should propagate so the real
+            # error is visible. Connectors with required ctor args
+            # provide them via ``constructor_kwargs_for_probe_cache_test``.
+            err = str(exc)
+            if "probe_cache_ttl" in err or "probe_cache_max_entries" in err:
+                raise AssertionError(
+                    f"{cls.__name__} must accept probe_cache_ttl and "
+                    f"probe_cache_max_entries kwargs (forward to super().__init__()). "
+                    f"Got: {exc}"
+                ) from exc
+            raise
+
+    def constructor_kwargs_for_probe_cache_test(self) -> dict[str, Any]:
+        """Override to provide the minimum kwargs your provider needs
+        when constructed standalone (e.g. mock ``api_key``, mock
+        ``output_dir``). Default returns an empty dict.
+
+        The test calls
+        ``cls(**this(), probe_cache_ttl=..., probe_cache_max_entries=...)``
+        — anything required to avoid an unrelated ``TypeError`` (other
+        than the kwargs under test) belongs here.
+        """
+        return {}
+
     # --- Cost tracking ---
 
     def test_invoke_populates_cost(self) -> None:

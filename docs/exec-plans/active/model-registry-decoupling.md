@@ -475,24 +475,27 @@ signal is preserved through the family layer:
   implemented and passing in CI for the relevant slugs — i.e., we replace
   the flag with a real liveness check, not just delete the signal.
 
-### Migration shim (RT-4)
+### Migration shim (RT-4) — historical, removed in PR #13
 
-PR #1 introduces `ModelRegistry` v2 with **both** `provider_families=()` and
-the legacy `defaults={}` parameters supported. Lookup precedence during the
-migration window:
+PR #1 introduced `ModelRegistry` v2 with **both** `provider_families=()` and
+a transitional `defaults={}` parameter so the per-connector PRs (#2-#12)
+could land incrementally. PR #13 deleted the shim. The post-shim
+lookup precedence is:
 
 1. user spec
 2. user family
 3. provider family
-4. **legacy `defaults` dict** (removed in PR #13)
-5. discovery cache
-6. fallback
+4. discovery cache
+5. fallback
 
-This is a **code-path** shim, not a regex-pattern shim. It cannot mask
-NOT_FOUND outcomes for unmigrated connectors because the legacy dict
-returns the same spec it does today. PR #13 deletes the `defaults=`
-constructor parameter and the dict lookup path; conformance test then
-asserts no `defaults=` calls remain in `libs/connectors/`.
+The legacy dict shared the user-spec tier (`self._user.get() or self._defaults.get()`),
+so removing it preserved exact-match semantics — every connector
+migrated cleanly to `provider_families=` (or `fallback=` alone for
+empty-catalog providers like LMNT / Replicate). Test fixtures that
+previously built registries via `ModelRegistry(defaults={...})`
+migrated to `reg.register(spec)` / `reg.extend(specs)`; the
+`tests/unit/test_no_defaults_kwarg.py` conformance gate prevents
+re-introduction.
 
 ## Connector classification
 
@@ -735,8 +738,8 @@ dependency-light order.
 | 6-7 | `runway`, `decart` | Mid-complexity catalogs with pricing. | Package tests + probe pattern-coverage |
 | 8-10 | `elevenlabs`, `openai`, `google` | NATIVE discovery; pricing tables removed; recipes published. | Package tests + probe + cookbook published |
 | 11-12 | `luma`, `stability-audio` | Smallest catalogs. | Package tests pass |
-| 13 | `core: remove transitional defaults= shim; finalize` | Delete the legacy dict path from registry. Conformance test asserts no `defaults=` in any connector. | All conformance tests pass; lint guard green |
-| 14 | `docs: migration guide + pricing recipes + README rewrites` | User-facing surface. | `verify-docs` skill green |
+| 13 | ~~`core: remove transitional defaults= shim; finalize`~~ ✅ landed | Deleted the legacy dict path from `ModelRegistry` (constructor parameter, `_defaults` field, `validate()` shim branch, `fork()` merge). Migrated 38 unit-test sites to `register()` / `extend()`. Cleaned LMNT and Replicate of `defaults={}` calls. Added `tests/unit/test_no_defaults_kwarg.py` conformance gate. Bonus: relaxed `FamilyProbe` from kwarg-pinned Protocol to `Callable[..., LiveProbeResult]` so SDK-based probes typecheck. | Conformance + core suites green |
+| 14 | ~~`docs: migration guide + pricing recipes + README rewrites`~~ ✅ landed | New `docs/guides/migrating-to-0.3.md` — TL;DR, before/after for 4 patterns, ValidationOutcome decision tree. `model-registry.md` reorganized so families lead. `provider-system.md` Cost Tracking → recipe pointer + new DiscoverySupport overview. `new-provider.md` rewritten with NATIVE / PARTIAL / NONE decision tree and `_fetch_models` / `_invoke_family_probe` examples. README + ARCHITECTURE cross-links. NVIDIA + GMICloud connector READMEs updated. All four `verify-docs` checks green; per-doc Python parse on 71 fenced blocks clean. | All `verify-docs` checks green |
 | 15 | `samples: migrate downstream reference apps` | Update `backblaze-labs/genblaze-gmicloud-pipeline` and `backblaze-labs/nvidia-nemotron-genblaze-b2`: delete `_defaults` mutations, replace per-model registry workarounds with family-pattern equivalents (most workarounds dissolve), add `Pipeline(preflight=False)` opt-out only where UX requires. **Lives in those repos, not this one** — this row tracks coordination. | Sample apps' CI green against `genblaze-core 0.3.0` |
 
 Total: **14 PRs in this repo + 1 coordination PR** for downstream samples.

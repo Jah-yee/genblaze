@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Hardening — production readiness (`model-registry-decoupling-hardening`)
+
+Closes the BLOCKER + HIGH-severity findings from the post-rollout deep
+review. See
+[`docs/exec-plans/active/model-registry-decoupling-hardening.md`](docs/exec-plans/active/model-registry-decoupling-hardening.md)
+for the design trail.
+
+**Security:**
+- `validate_chain_input_url` rewritten with multi-layer hardening:
+  RFC 8089 netloc check; `urllib.parse.unquote()` before traversal
+  detection (catches `..%2F` percent-encoded bypass); canonicalization
+  via `Path.resolve()` (collapses `..`, follows symlinks, resolves
+  macOS `/private/etc` aliases); denylist on the canonical path
+  (`/proc`, `/dev`, `/sys`, `/etc`, `/private/etc`, `/private/var/run`,
+  `/run/secrets`, `/var/run/secrets`); opt-in `file_root_allowlist`
+  parameter for strict containment. Test corpus parametrized at 35
+  cases including symlink-resolves-outside-root, percent-encoded,
+  and double-encoded variants.
+
+**Concurrency:**
+- `BaseProvider._cached_probe` cleanup moved into `try/finally` so a
+  `BaseException` from `_invoke_family_probe` no longer orphans the
+  in-flight `threading.Event` (would have permanently blocked all
+  subsequent waiters for that slug). Pinned by 7 regression tests
+  including a 20× repeat run via `pytest-repeat`.
+- `BaseProvider._poll_cache` reads/writes/cleanup now guarded by
+  `threading.Lock`. Read-then-pop is atomic — concurrent `ainvoke()`
+  callers (which dispatch via `asyncio.to_thread`) can no longer race.
+  5 regression tests including an 8-thread × 100-cycle stress run.
+- `FamilyProbe` contract docstring updated to require bounded duration
+  via the underlying transport (`httpx.Client(timeout=...)` etc.) —
+  the framework deliberately does not wrap probes in a separate
+  `concurrent.futures` timeout (would add a thread layer without
+  cancelling the in-flight HTTP request).
+
+**Registry correctness:**
+- `ModelRegistry.register_pricing(slug, strategy)` now falls through
+  to `match_family()` when the slug isn't yet user-registered. The
+  family-resolved spec (with all its param contracts) becomes the
+  base; pricing layered on top. Previously, a bare `ModelSpec` with
+  only `pricing` was minted, silently dropping the family's param
+  aliases / schemas / allowlist / extras.
+- `ModelRegistry.register_family()` now enforces a separate
+  `MAX_USER_FAMILIES = 32` cap on the user layer. The connector cap
+  (`MAX_PROVIDER_FAMILIES = 32`) only counts provider families — a
+  connector at its provider cap does not block users from registering
+  their own families. Total scan cost stays under 64 patterns.
+- `ModelRegistry.fork()` now carries `_warned_deprecated` from parent
+  to clone. Multi-tenant deployments that fork-per-request no longer
+  spam deprecation warnings on every fork for an already-warned alias.
+
+**Connector correctness:**
+- `genblaze-google` Veo split into two families:
+  `GOOGLE_VEO_LEGACY_FAMILY` (`^veo-2[.-]`, no audio) and
+  `GOOGLE_VEO_FAMILY` (`^veo-` catch-all, `extras["has_audio"]=True`).
+  `VeoProvider.fetch_output` reads `extras.get("has_audio")` instead
+  of `step.model.startswith("veo-3")` — future `veo-N` slugs (N≥3)
+  inherit synchronized-audio metadata automatically without a
+  provider release.
+
+**API uniformity:**
+- LMNT, Replicate, and all NVIDIA providers (chat / audio / video /
+  image) now accept `probe_cache_ttl` and `probe_cache_max_entries`
+  ctor kwargs (no-ops on NATIVE / NONE providers; accepted for API
+  uniformity).
+- New `ProviderComplianceTests.test_accepts_probe_cache_kwargs`
+  conformance test calls each provider's constructor with the kwargs
+  and asserts no `TypeError` — catches `**kwargs`-forwarders that an
+  inspect-only check would miss.
+
+**Test coverage:**
+- New `tests/test_catalog_decoupling.py` for LMNT and Replicate (the
+  two empty-registry NATIVE/NONE proof-points).
+
+**Documentation accuracy:**
+- Migration guide and `model-registry.md` outcome tables now match
+  `validation.py` exactly: four `ValidationOutcome` values
+  (`OK_AUTHORITATIVE`, `OK_PROVISIONAL`, `UNKNOWN_PERMISSIVE`,
+  `NOT_FOUND`); five `ValidationSource` values (`USER`, `FAMILY`,
+  `DISCOVERY`, `PROBE`, `FALLBACK`). Phantom `KNOWN_UNSTABLE` enum
+  removed; the unstable-slug case correctly described as
+  `OK_PROVISIONAL` with `detail="known_unstable; ..."`.
+- `Pipeline.preflight()` documented as a fluent setter (returns
+  `Pipeline`); validation runs automatically inside `run()`. Use
+  `provider.validate_model(slug)` for direct slug checks.
+- `discover_models()` for NONE providers documented as returning
+  `DiscoveryResult.unsupported(...)` (not empty results).
+- `new-provider.md` `pyproject.toml` template constraint bumped to
+  `>=0.3.0,<0.4`.
+- LMNT added to the migration guide's NONE-provider list (matches
+  CHANGELOG and `provider-system.md`).
+- Deprecation horizon section added to migration guide:
+  `BaseProvider.probe_model()` → removed in 0.4.0;
+  `ModelRegistry(defaults=...)` already removed in 0.3.0.
+
 ### Added — model registry decoupling (PRs #1–#4)
 
 - **`genblaze-core 0.3.0` (in progress)**: introduces a new pattern-based
@@ -110,6 +205,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     table removed; recipe published preserving the duration-fallback
     behavior (probe → params).
 
+### Removed — `ModelRegistry(defaults=...)` transitional shim
+
+- The ``defaults=`` constructor parameter is gone. PR #1 added it as a
+  code-path migration shim alongside ``provider_families=`` so the
+  per-connector PRs (#2-#12) could land incrementally without breaking
+  the world. Every connector now uses ``provider_families=`` (or
+  ``fallback=`` alone for empty-catalog providers like LMNT and
+  Replicate). User code that previously built registries via
+  ``ModelRegistry(defaults={"slug": spec})`` should migrate to the
+  post-construction surface:
+
+  ```python
+  reg = ModelRegistry()
+  reg.register(spec)         # single spec
+  reg.extend([s1, s2, ...])  # bulk
+  ```
+
+  Resolution semantics are unchanged — the legacy ``_defaults`` dict
+  and the user ``_user`` dict were always checked at the same
+  precedence tier (``_user.get(slug) or _defaults.get(slug)``), so
+  migrating to ``register()`` / ``extend()`` is a pure constructor-
+  vs-method rephrasing. The dead-code branch in ``validate()`` that
+  minted ``OK_AUTHORITATIVE`` with a ``"legacy defaults shim"``
+  detail string is also gone.
+
+- New conformance test
+  (``libs/core/tests/unit/test_no_defaults_kwarg.py``) gates the
+  connector tree against re-introducing the kwarg.
+
+- ``FamilyProbe`` switched from a kwarg-pinned ``Protocol`` to a
+  ``Callable[..., LiveProbeResult]`` type alias. The old shape locked
+  every probe's keyword argument to ``http: httpx.Client``, which
+  excluded SDK-based probes (e.g. ``client.models.get`` for
+  ``genblaze-google``). The new alias is honest about transport
+  variability — connectors choose their probe's keyword shape; the
+  contract is "first positional is slug, return is
+  ``LiveProbeResult``." Fixes the typecheck-connectors CI failure
+  introduced when PR #10 landed before the protocol was loosened.
+
 ### Fixed — F-2026-05-04-01 (NVIDIA `nvidia/riva-tts` 404)
 
 - The retired `nvidia/riva-tts` slug is no longer pinned in the SDK. Users
@@ -141,6 +275,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_model(refresh=True)` with a coerced `ProbeResult` for legacy
   `tools/probe_models.py` consumers. Slated for removal in
   `genblaze-core 0.4.0`. Use `validate_model()` directly going forward.
+
+### Documentation
+
+- New migration guide: [`docs/guides/migrating-to-0.3.md`](docs/guides/migrating-to-0.3.md)
+  — TL;DR for callers of 0.2.x, before/after for the 4 most common
+  registry patterns, validation-outcome handling, and the decision
+  tree for unexpected `NOT_FOUND` outcomes.
+- `docs/features/model-registry.md` reorganized so `ModelFamily` leads
+  the conceptual picture (pattern-keyed routing) with `ModelSpec` as
+  the per-slug override path. Adds `DiscoverySupport` / `FamilyProbe` /
+  `ValidationResult` reference sections and a `validate_model(refresh=True)`
+  example.
+- `docs/features/provider-system.md` Cost Tracking section rewritten
+  to point at [`docs/reference/pricing-recipes.md`](docs/reference/pricing-recipes.md)
+  instead of listing per-connector strategies that no longer ship.
+  New `DiscoverySupport` overview describing the three-tier classification.
+- `docs/guides/new-provider.md` updated for the families-first model:
+  new "Declare your model families and DiscoverySupport" section with
+  a decision tree for picking `NATIVE` / `PARTIAL` / `NONE` and
+  worked examples for each tier's required hooks
+  (`_fetch_models`, `_invoke_family_probe`).
+- `README.md` and `ARCHITECTURE.md` updated to surface the new
+  catalog architecture and cross-link the migration guide.
+- `docs/reference/pricing-recipes.md` is now the single source of truth
+  for per-provider rate sheets (LMNT, Replicate, GMICloud, Runway,
+  Decart, ElevenLabs, OpenAI, Google, Luma, Stability-Audio). Each
+  section is dated and linked to the upstream pricing URL.
 
 ## [0.2.9] - 2026-04-30
 

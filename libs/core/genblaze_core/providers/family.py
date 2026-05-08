@@ -65,6 +65,22 @@ Concrete shapes used in this repo:
 
 * ``def empty_payload_genai_probe(slug: str, *, http: httpx.Client) -> LiveProbeResult``
 * ``def google_models_get_probe(slug: str, *, client: genai.Client) -> LiveProbeResult``
+
+**Bounded-duration contract.** Probes MUST respect a finite duration
+via their underlying transport (``httpx.Client(timeout=...)`` for HTTP
+probes; the equivalent on SDK clients). The framework guarantees
+exception-safe single-flight cleanup but does NOT wrap the probe in a
+separate timeout layer — a probe that blocks indefinitely will hold
+the single-flight slot for that slug indefinitely. Concurrent waiters
+fall through to ``UNKNOWN`` after ``BaseProvider._PROBE_INFLIGHT_WAIT_SECONDS``,
+but the elected fetcher itself remains stuck.
+
+Why no framework-level timeout: a ``concurrent.futures`` timeout would
+add a thread layer without actually cancelling the in-flight HTTP
+request (a future's ``cancel()`` returns ``False`` once the call is
+running), and would serialize probes through a worker pool. The right
+control surface is the transport's native timeout; connectors are
+responsible for wiring it correctly.
 """
 
 
@@ -219,12 +235,24 @@ class FamilyMatch:
     spec: ModelSpec
 
 
-# Hard cap on the number of families per provider's registry. Keeps the
-# linear-scan resolution under the perf budget regardless of how many
-# connectors evolve. Connectors hitting the cap should consolidate
-# patterns or split into multiple modality registries — not raise the
-# cap.
+# Hard cap on the number of CONNECTOR-shipped families per registry.
+# Bounds the linear-scan resolution cost every consumer of this
+# connector pays. Enforced at construction in ``ModelRegistry.__init__``.
+# Connectors hitting the cap should consolidate patterns or split into
+# multiple modality registries — not raise the cap.
 MAX_PROVIDER_FAMILIES: int = 32
+
+# Hard cap on USER-registered families per registry. Bounds the
+# linear-scan cost the user has explicitly opted into via
+# ``register_family()``. Per-user; **does not interact with**
+# ``MAX_PROVIDER_FAMILIES`` — a connector at the provider cap does
+# NOT block users from registering their own families. Enforced
+# inside ``ModelRegistry.register_family``.
+#
+# Total scan cost is bounded at ``MAX_PROVIDER_FAMILIES + MAX_USER_FAMILIES``
+# = 64 patterns; well under the perf budget for adversarial input
+# (<100µs with the ``pattern_safety`` guard).
+MAX_USER_FAMILIES: int = 32
 
 
 __all__ = [
@@ -233,5 +261,6 @@ __all__ = [
     "FamilyProbe",
     "LiveProbeResult",
     "MAX_PROVIDER_FAMILIES",
+    "MAX_USER_FAMILIES",
     "ModelFamily",
 ]

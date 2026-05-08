@@ -253,8 +253,9 @@ class Pipeline(Runnable[None, PipelineResult]):
         # _validate_steps() calls validate_model() on each step's provider.
         # NOT_FOUND raises before any wire calls; OK_PROVISIONAL and
         # UNKNOWN_PERMISSIVE emit a single WARN per (provider, slug) per
-        # process. Hot paths can opt out via Pipeline(preflight=False) or
-        # Pipeline.preflight(False).
+        # Pipeline instance (the dedup set below resets on each Pipeline
+        # construction). Hot paths can opt out via Pipeline(preflight=False)
+        # or Pipeline.preflight(False).
         self._preflight: bool = preflight
         # Tracks (provider_name, slug) tuples already warned about so the
         # WARN log is one-per-pipeline-lifetime, mirroring the

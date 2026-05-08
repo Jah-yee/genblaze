@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-04-23 -->
+<!-- last_verified: 2026-05-07 -->
 # genblaze-gmicloud
 
 **[GMICloud](https://gmicloud.ai) multi-provider video / image / audio adapters for [genblaze](https://github.com/backblaze-labs/genblaze) — access Seedance, Kling, Veo, Sora, Wan, Seedream, FLUX, Gemini image, ElevenLabs, MiniMax and more through one API with SHA-256 provenance manifests.**
@@ -10,7 +10,7 @@
 - **One API, dozens of models** — text-to-video (Seedance, Kling, Veo, Sora, Wan), text-to-image (Seedream, FLUX, Gemini, Reve), audio (ElevenLabs, MiniMax TTS/Music).
 - **LLM access too** — standalone `chat()` wrapper for Llama, DeepSeek, Qwen over GMICloud's OpenAI-compatible inference endpoint (see below).
 - **Provenance by default** — SHA-256-verified manifest with provider, model, prompt, params, cost.
-- **Cost tracking** — `step.cost_usd` is populated from GMICloud's response.
+- **Cost tracking** — register a pricing strategy from [`docs/reference/pricing-recipes.md`](../../../docs/reference/pricing-recipes.md) and `step.cost_usd` is populated automatically.
 - **Production-ready** — retries, timeouts, progress streaming, step caching.
 - **Durable storage** — plug `genblaze-s3` in for Backblaze B2 / AWS S3 / R2 / MinIO persistence.
 
@@ -50,7 +50,9 @@ run, manifest = (
           modality=Modality.VIDEO, duration=10, aspect_ratio="16:9")
     .run(timeout=600)
 )
-print(run.steps[0].assets[0].url, f"${run.steps[0].cost_usd:.3f}")
+print(run.steps[0].assets[0].url)
+# step.cost_usd is None unless you've registered pricing — see
+# docs/reference/pricing-recipes.md for the GMICloud rate sheet.
 ```
 
 ## Quickstart — image (Seedream)

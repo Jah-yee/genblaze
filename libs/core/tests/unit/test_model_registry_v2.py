@@ -54,10 +54,6 @@ class TestConstruction:
         reg = ModelRegistry(provider_families=[fam])
         assert reg.families == (fam,)
 
-    def test_legacy_defaults_still_accepted(self) -> None:
-        reg = ModelRegistry(defaults={"foo": _img_spec("foo")})
-        assert reg.get("foo").model_id == "foo"
-
     def test_max_families_cap_enforced(self) -> None:
         too_many = [_family(f"f{i}", rf"^family-{i}/") for i in range(MAX_PROVIDER_FAMILIES + 1)]
         with pytest.raises(ValueError, match="cap is"):
@@ -128,13 +124,6 @@ class TestValidate:
         assert r.outcome is ValidationOutcome.OK_AUTHORITATIVE
         assert r.source is ValidationSource.USER
 
-    def test_legacy_defaults_returns_authoritative(self) -> None:
-        reg = ModelRegistry(defaults={"legacy": _img_spec("legacy")})
-        r = reg.validate("legacy")
-        assert r.outcome is ValidationOutcome.OK_AUTHORITATIVE
-        assert r.source is ValidationSource.USER
-        assert "legacy defaults shim" in (r.detail or "")
-
     def test_family_match_without_discovery_provisional(self) -> None:
         fam = _family("flux", r"^black-forest-labs/flux")
         reg = ModelRegistry(provider_families=[fam])
@@ -203,11 +192,6 @@ class TestContainsAndKnown:
     def test_contains_user_registered(self) -> None:
         reg = ModelRegistry()
         reg.register(_img_spec("x"))
-        assert "x" in reg
-        assert reg.has("x")
-
-    def test_contains_legacy_default(self) -> None:
-        reg = ModelRegistry(defaults={"x": _img_spec("x")})
         assert "x" in reg
         assert reg.has("x")
 

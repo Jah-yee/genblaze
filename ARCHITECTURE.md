@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-04-17 -->
+<!-- last_verified: 2026-05-07 -->
 # Architecture
 
 ## Components
@@ -94,7 +94,8 @@
 - `on_submit` callback: fires after `submit()` with `(step_id, prediction_id)` for crash-recovery checkpointing
 - Parameter normalization: `provider.normalize_params()` maps standard names (duration, resolution) to native ones
 - Model fallback chains: `fallback_models` in `.step()` auto-retries with alternate models on `MODEL_ERROR`
-- Cost tracking: providers populate `step.cost_usd` from static pricing tables
+- Cost tracking: pricing is **user-registered** as of 0.3.0 — connectors ship zero hardcoded prices; users register a `PricingStrategy` per slug (or per family) and the base class populates `step.cost_usd` after `fetch_output()`. Per-provider rate sheets live in `docs/reference/pricing-recipes.md`
+- Catalog routing: connectors ship pattern-keyed `ModelFamily` rules instead of slug lists. Each family declares a regex, a `spec_template`, and optionally a `FamilyProbe`. The registry's `validate_model()` returns a typed `ValidationResult` (`OK_AUTHORITATIVE` / `OK_PROVISIONAL` / `NOT_FOUND` / `KNOWN_UNSTABLE`); `Pipeline.preflight()` gates against it. Provider classes declare a `DiscoverySupport` tier (`NATIVE` / `PARTIAL` / `NONE`) so the SDK is honest about what it can verify
 - Capability validation: `ProviderCapabilities.accepts_chain_input` flag; pipeline validates modality + chain compatibility at `run()` time before executing any steps
 - Chain input validation: `validate_chain_input_url()` checks chain input URLs before forwarding to external APIs (allows `file://` + `https://`)
 - Pipeline chain safety: failed steps in `chain=True` mode clear `prev_assets` so subsequent steps receive empty inputs (no stale output leakage)
@@ -119,6 +120,11 @@
 
 - Runnable ABC: `libs/core/genblaze_core/runnable/base.py`
 - Provider interface: `libs/core/genblaze_core/providers/base.py`
+- Model registry: `libs/core/genblaze_core/providers/model_registry.py`
+- ModelFamily / DiscoverySupport / FamilyProbe: `libs/core/genblaze_core/providers/family.py`
+- ValidationResult: `libs/core/genblaze_core/providers/validation.py`
+- Discovery cache: `libs/core/genblaze_core/providers/discovery.py`
+- Pricing helpers: `libs/core/genblaze_core/providers/pricing.py`
 - Replicate adapter: `libs/connectors/replicate/genblaze_replicate/provider.py`
 - Pipeline: `libs/core/genblaze_core/pipeline/pipeline.py`
 - Step cache: `libs/core/genblaze_core/pipeline/cache.py`
@@ -166,6 +172,7 @@
 - [Embed Policy](docs/features/embed-policy.md)
 - [Iteration & Lineage](docs/features/iteration.md)
 - [LLM Calls (Standalone Chat)](docs/features/llm-calls.md)
+- [Migrating to 0.3.0](docs/guides/migrating-to-0.3.md)
 - [Object Storage](docs/features/object-storage.md)
 - [Parquet Sink](docs/features/parquet-sink.md)
 - [Queue Integration](docs/features/queue-integration.md)

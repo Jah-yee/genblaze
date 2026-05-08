@@ -85,10 +85,11 @@ class ReplicateProvider(BaseProvider):
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        # No enumerable defaults — every model uses the fallback spec.
-        # Discovery cache is wired per-instance in __init__ so each
+        # Every model resolves through the fallback spec — Replicate's
+        # catalog is enumerated only via discovery, not shipped here.
+        # The discovery cache is wired per-instance in __init__ so each
         # provider sees its own credentials' view of the catalog.
-        return ModelRegistry(defaults={}, fallback=_FALLBACK_SPEC)
+        return ModelRegistry(fallback=_FALLBACK_SPEC)
 
     def get_capabilities(self) -> ProviderCapabilities:
         """Replicate: multi-modal generation depending on selected model."""
@@ -106,8 +107,18 @@ class ReplicateProvider(BaseProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        # probe_cache_* are no-ops on this NATIVE-discovery provider; accepted
+        # for API uniformity so calling code can pass them to any provider
+        # without TypeError.
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self.poll_interval = poll_interval
         self._client: Any = None
         self._api_token = api_token

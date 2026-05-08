@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-04-08 -->
+<!-- last_verified: 2026-05-07 -->
 # Feature: Provider System
 
 ## Purpose
@@ -61,21 +61,56 @@ Providers should always raise `ProviderError` with an explicit `error_code`. The
 
 ## Cost Tracking
 
-Pricing is declared per-model on `ModelSpec.pricing` (a `PricingStrategy` callable) and resolved automatically by the base class after `fetch_output()`. Each connector exposes its rates via `create_registry()`:
+As of `genblaze-core` 0.3.0 the SDK ships **zero hardcoded prices**.
+`step.cost_usd` is `None` after `provider.invoke(step)` unless the user
+has registered a pricing strategy.
 
-- DALL-E / gpt-image: `tiered` pricing keyed by `(quality, size)`; `gpt-image-2` disclosed as `pricing=None`
-- Sora, Luma: `pricing=None` until per-second formulas are disclosed
-- TTS (OpenAI, ElevenLabs, LMNT): `per_input_chars(rate, per=...)`
-- ElevenLabs SFX: `bucketed_by_duration([((lo, hi), price), ...])`
-- Imagen, Decart image: `per_unit(rate)`
-- Decart video: `by_param("resolution", ...)` (per-resolution flat rate)
-- Google Veo, Stability Audio, GMI Seedance 2.0: per-output-second
-- Runway: `by_model_and_param("duration", ...)` tuple-keyed
-- Replicate: `per_response_metric` reading `predict_time` from the Replicate response
+Per-provider rate tables (with snapshot dates and upstream pricing URLs)
+live in [`docs/reference/pricing-recipes.md`](../reference/pricing-recipes.md).
+Each section is a copy-pasteable Python block:
 
-Users can override any model's pricing at runtime via `Provider.models_default().fork().register_pricing(model_id, strategy)` — no provider release required. Unknown models (newly-released, dated snapshots, aliases) fall back to a permissive spec and submit successfully with `cost_usd=None`.
+```python
+from genblaze_core.providers import per_unit
+from genblaze_openai import DalleProvider
 
-See [model-registry.md](model-registry.md) for the full `ModelSpec` surface (pricing strategies, param aliases, input routing, schemas, constraints).
+provider = DalleProvider(api_key="...")
+provider.models.register_pricing("dall-e-3", per_unit(0.040))
+```
+
+`PricingStrategy` is a `Callable[[PricingContext], float | None]` —
+keep it pure and synchronous. The base class runs the strategy
+automatically after `fetch_output()` and sets `step.cost_usd`. Unknown
+models fall back to `pricing=None` and submit successfully with
+`cost_usd=None`.
+
+`provider.estimate_cost(model, params, n=1) -> Decimal | None` works
+once pricing is registered — synthesizes a fake step + asset(s) so
+per-unit / per-second / param-based strategies estimate without an API
+call. Response-only strategies (`per_response_metric`) return `None`.
+
+See [model-registry.md](model-registry.md) for the full `ModelFamily` /
+`ModelSpec` surface (pricing strategies, param aliases, input routing,
+schemas, constraints) and
+[migrating-to-0.3.md](../guides/migrating-to-0.3.md) for the upgrade
+guide.
+
+## Discovery Support
+
+Every provider declares its catalog tier as a class constant — drives
+the outcomes `validate_model()` returns and what `Pipeline.preflight()`
+gates against.
+
+| Tier | Meaning | `validate_model()` returns |
+|---|---|---|
+| `DiscoverySupport.NATIVE` | Authoritative `GET /models` (or equivalent). Family-matched slugs upgrade to `OK_AUTHORITATIVE` iff in the live discovery cache | `OK_AUTHORITATIVE` (cached/refreshed) or `NOT_FOUND` |
+| `DiscoverySupport.PARTIAL` | No global catalog, but per-slug probing is the authoritative path (HEAD on a model URL, `client.models.get`, empty-payload-POST trick). Family + probe → authoritative answer | `OK_AUTHORITATIVE` (probe LIVE) / `NOT_FOUND` (probe DEAD) / `OK_PROVISIONAL` (probe UNKNOWN) |
+| `DiscoverySupport.NONE` | No catalog API, no per-slug probe. Family match is a structural hint only | `OK_PROVISIONAL` (family match) / `NOT_FOUND` (no family match) |
+
+Connectors as of 0.3.0:
+
+- `NATIVE`: OpenAI (TTS / DALL-E / Sora), ElevenLabs TTS, Replicate, NVIDIA chat
+- `PARTIAL`: NVIDIA generative endpoints (audio / video / image), GMICloud, Google (Veo / Imagen)
+- `NONE`: Decart, Runway, Luma, Stability-Audio, ElevenLabs SFX, LMNT
 
 ## Error Deduplication
 Each connector family shares a single error mapper module:

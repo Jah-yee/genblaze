@@ -1,3 +1,4 @@
+<!-- last_verified: 2026-05-07 -->
 # Video & Audio Parameter Conventions
 
 Standard `step.params` keys that video/audio providers should map from.

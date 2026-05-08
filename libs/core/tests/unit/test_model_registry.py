@@ -280,7 +280,8 @@ class TestPricing:
 
 class TestModelRegistry:
     def test_get_default(self):
-        reg = ModelRegistry(defaults={"m1": ModelSpec(model_id="m1", pricing=per_unit(0.10))})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m1", pricing=per_unit(0.10)))
         assert reg.get("m1").model_id == "m1"
 
     def test_get_unknown_returns_fallback(self):
@@ -288,7 +289,8 @@ class TestModelRegistry:
         assert reg.get("unknown") is FALLBACK_SPEC
 
     def test_user_overrides_default(self):
-        reg = ModelRegistry(defaults={"m1": ModelSpec(model_id="m1", pricing=per_unit(0.10))})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m1", pricing=per_unit(0.10)))
         reg.register(ModelSpec(model_id="m1", pricing=per_unit(0.20)))
         spec = reg.get("m1")
         ctx = PricingContext(
@@ -299,7 +301,8 @@ class TestModelRegistry:
         assert spec.pricing(ctx) == pytest.approx(0.20)
 
     def test_register_pricing_only(self):
-        reg = ModelRegistry(defaults={"m1": ModelSpec(model_id="m1")})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m1"))
         reg.register_pricing("m1", per_unit(0.05))
         ctx = PricingContext(
             step=_step("m1"),
@@ -308,38 +311,116 @@ class TestModelRegistry:
         )
         assert reg.get("m1").pricing(ctx) == pytest.approx(0.05)
 
+    def test_register_pricing_preserves_family_param_contracts(self):
+        """H4 regression: ``register_pricing`` for a family-matched slug
+        not yet in the user layer must clone the family-resolved spec
+        (with all its param contracts) and apply pricing on top —
+        rather than minting a bare ``ModelSpec`` that drops every
+        family attribute the slug would otherwise inherit.
+        """
+        import re
+
+        from genblaze_core.models.enums import Modality
+        from genblaze_core.providers import ModelFamily
+
+        family = ModelFamily(
+            name="test-family",
+            pattern=re.compile(r"^vendor-line-"),
+            spec_template=ModelSpec(
+                model_id="*",
+                modality=Modality.VIDEO,
+                param_aliases={"aspect_ratio": "ratio"},
+                param_allowlist=frozenset({"prompt", "ratio"}),
+                extras={"is_test": True},
+            ),
+            description="Test family for H4 regression.",
+            example_slugs=("vendor-line-pro",),
+        )
+        reg = ModelRegistry(provider_families=(family,))
+
+        reg.register_pricing("vendor-line-pro", per_unit(0.42))
+
+        spec = reg.get("vendor-line-pro")
+        # Pricing was applied.
+        ctx = PricingContext(
+            step=_step("vendor-line-pro"),
+            assets=[Asset(url="u", media_type="image/png")],
+            provider_payload={},
+        )
+        assert spec.pricing(ctx) == pytest.approx(0.42)
+        # And the family's param contracts are preserved.
+        assert spec.param_aliases == {"aspect_ratio": "ratio"}
+        assert spec.param_allowlist == frozenset({"prompt", "ratio"})
+        assert spec.extras == {"is_test": True}
+        assert spec.modality is Modality.VIDEO
+        # model_id was substituted to the actual slug, not "*".
+        assert spec.model_id == "vendor-line-pro"
+
+    def test_register_pricing_unknown_slug_falls_back_to_bare_spec(self):
+        """H4: when no family matches and no user spec exists, the
+        existing fallback (bare ``ModelSpec`` with only pricing) is
+        preserved."""
+        reg = ModelRegistry()
+        reg.register_pricing("brand-new-slug", per_unit(0.05))
+        spec = reg.get("brand-new-slug")
+        assert spec.model_id == "brand-new-slug"
+        assert spec.pricing is not None
+        # No family contracts since no family matched.
+        assert spec.param_aliases == {}
+        assert spec.param_allowlist is None
+
+    def test_register_pricing_preserves_existing_user_spec(self):
+        """H4: if the slug is already in ``_user``, only ``pricing``
+        is replaced — the rest of the existing user spec stays."""
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="m1",
+                pricing=per_unit(0.10),
+                param_aliases={"x": "y"},
+                extras={"keep": True},
+            )
+        )
+        reg.register_pricing("m1", per_unit(0.99))
+        spec = reg.get("m1")
+        ctx = PricingContext(
+            step=_step("m1"),
+            assets=[Asset(url="u", media_type="image/png")],
+            provider_payload={},
+        )
+        assert spec.pricing(ctx) == pytest.approx(0.99)
+        assert spec.param_aliases == {"x": "y"}
+        assert spec.extras == {"keep": True}
+
     def test_aliases_resolve(self):
-        reg = ModelRegistry(
-            defaults={
-                "gpt-image-2": ModelSpec(
-                    model_id="gpt-image-2",
-                    aliases=frozenset({"chatgpt-image-latest"}),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="gpt-image-2",
+                aliases=frozenset({"chatgpt-image-latest"}),
+            )
         )
         assert reg.get("chatgpt-image-latest").model_id == "gpt-image-2"
 
     def test_deprecated_alias_resolves_with_warning(self):
-        reg = ModelRegistry(
-            defaults={
-                "reve-edit-fast-20251030": ModelSpec(
-                    model_id="reve-edit-fast-20251030",
-                    deprecated_aliases=frozenset({"Reve-Edit-Fast"}),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="reve-edit-fast-20251030",
+                deprecated_aliases=frozenset({"Reve-Edit-Fast"}),
+            )
         )
         with pytest.warns(DeprecationWarning, match="Reve-Edit-Fast"):
             spec = reg.get("Reve-Edit-Fast")
         assert spec.model_id == "reve-edit-fast-20251030"
 
     def test_deprecated_alias_canonical_lookup_does_not_warn(self):
-        reg = ModelRegistry(
-            defaults={
-                "reve-edit-fast-20251030": ModelSpec(
-                    model_id="reve-edit-fast-20251030",
-                    deprecated_aliases=frozenset({"Reve-Edit-Fast"}),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="reve-edit-fast-20251030",
+                deprecated_aliases=frozenset({"Reve-Edit-Fast"}),
+            )
         )
         import warnings
 
@@ -350,11 +431,8 @@ class TestModelRegistry:
 
     def test_deprecated_alias_warning_fires_once_per_slug(self):
         """First lookup warns; subsequent lookups of the same slug stay silent."""
-        reg = ModelRegistry(
-            defaults={
-                "new": ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})),
-            }
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})))
         import warnings
 
         with warnings.catch_warnings(record=True) as captured:
@@ -366,61 +444,91 @@ class TestModelRegistry:
         assert len(dep_warnings) == 1
 
     def test_resolve_canonical_known(self):
-        reg = ModelRegistry(
-            defaults={"seedream-5.0-lite": ModelSpec(model_id="seedream-5.0-lite")}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="seedream-5.0-lite"))
         assert reg.resolve_canonical("seedream-5.0-lite") == "seedream-5.0-lite"
 
     def test_resolve_canonical_deprecated_alias(self):
-        reg = ModelRegistry(
-            defaults={
-                "seedream-5.0-lite": ModelSpec(
-                    model_id="seedream-5.0-lite",
-                    deprecated_aliases=frozenset({"Seedream-5.0-Lite"}),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="seedream-5.0-lite",
+                deprecated_aliases=frozenset({"Seedream-5.0-Lite"}),
+            )
         )
         with pytest.warns(DeprecationWarning):
             assert reg.resolve_canonical("Seedream-5.0-Lite") == "seedream-5.0-lite"
 
     def test_resolve_canonical_unknown_passes_through(self):
         """Unknown ids match only the fallback; caller input is returned verbatim."""
-        reg = ModelRegistry(defaults={"known": ModelSpec(model_id="known")})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="known"))
         assert reg.resolve_canonical("brand-new-model-v99") == "brand-new-model-v99"
 
     def test_resolve_canonical_custom_fallback_does_not_substitute(self):
         """A user-defined fallback with a real model_id must not silently replace
         the caller's slug on the wire — fallback is identity-checked, not sentinel."""
-        reg = ModelRegistry(
-            defaults={"known": ModelSpec(model_id="known")},
-            fallback=ModelSpec(model_id="my-default"),
-        )
+        reg = ModelRegistry(fallback=ModelSpec(model_id="my-default"))
+        reg.register(ModelSpec(model_id="known"))
         assert reg.resolve_canonical("unknown") == "unknown"
 
     def test_has_recognizes_deprecated_alias(self):
-        reg = ModelRegistry(
-            defaults={
-                "new": ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})),
-            }
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})))
         assert reg.has("new") is True
         assert reg.has("old") is True
         assert reg.has("missing") is False
 
     def test_fork_isolation(self):
-        reg = ModelRegistry(defaults={"m1": ModelSpec(model_id="m1")})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m1"))
         forked = reg.fork()
         forked.register(ModelSpec(model_id="new", pricing=per_unit(0.5)))
         assert "new" in forked.known()
         assert "new" not in reg.known()
 
+    def test_fork_carries_deprecation_warning_state(self):
+        """H6 regression: ``fork()`` must copy ``_warned_deprecated`` so a
+        per-request fork in a multi-tenant deployment doesn't re-warn on
+        every fork for the same already-warned alias."""
+        import warnings
+
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})))
+        # Trigger the once-per-slug warning on the parent.
+        with pytest.warns(DeprecationWarning):
+            reg.get("old")
+
+        # Forks should NOT re-warn on the same slug — the parent already
+        # owns the warning for the lifetime of the registry tree.
+        forked = reg.fork()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning fails the test
+            spec = forked.get("old")
+        assert spec.model_id == "new"
+
+    def test_fork_warning_state_is_independent(self):
+        """H6: forks share the parent's already-warned state at fork time
+        but new warnings on a clone don't leak back to the parent."""
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="new", deprecated_aliases=frozenset({"old"})))
+        forked = reg.fork()
+        # Clone warns first; parent's set should remain empty.
+        with pytest.warns(DeprecationWarning):
+            forked.get("old")
+        # Parent has not warned — its set should still allow a warning.
+        with pytest.warns(DeprecationWarning):
+            reg.get("old")
+
     def test_known(self):
-        reg = ModelRegistry(defaults={"a": ModelSpec(model_id="a"), "b": ModelSpec(model_id="b")})
+        reg = ModelRegistry()
+        reg.extend([ModelSpec(model_id="a"), ModelSpec(model_id="b")])
         reg.register(ModelSpec(model_id="c"))
         assert reg.known() == ["a", "b", "c"]
 
     def test_register_override_false_raises(self):
-        reg = ModelRegistry(defaults={"m1": ModelSpec(model_id="m1")})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m1"))
         with pytest.raises(ValueError):
             reg.register(ModelSpec(model_id="m1"), override=False)
 
@@ -428,6 +536,73 @@ class TestModelRegistry:
         reg = ModelRegistry()
         reg.extend([ModelSpec(model_id="x"), ModelSpec(model_id="y")])
         assert reg.known() == ["x", "y"]
+
+    def test_register_family_enforces_user_layer_cap(self):
+        """H5: ``register_family`` enforces ``MAX_USER_FAMILIES`` against
+        only the user layer — a connector at its provider cap MUST
+        NOT block users from registering their own families."""
+        import re
+
+        from genblaze_core.providers import (
+            MAX_PROVIDER_FAMILIES,
+            MAX_USER_FAMILIES,
+            ModelFamily,
+        )
+
+        # Connector ships at the provider cap.
+        provider_families = [
+            ModelFamily(
+                name=f"p{i}",
+                pattern=re.compile(rf"^p{i}-"),
+                spec_template=ModelSpec(model_id="*"),
+                description=f"Provider family {i}",
+            )
+            for i in range(MAX_PROVIDER_FAMILIES)
+        ]
+        reg = ModelRegistry(provider_families=provider_families)
+
+        # User registers MAX_USER_FAMILIES — all succeed.
+        for i in range(MAX_USER_FAMILIES):
+            reg.register_family(
+                ModelFamily(
+                    name=f"u{i}",
+                    pattern=re.compile(rf"^u{i}-"),
+                    spec_template=ModelSpec(model_id="*"),
+                    description=f"User family {i}",
+                )
+            )
+
+        # The next user registration must raise — and the error message
+        # must name the user layer (not "provider families") so the
+        # cause is clear.
+        with pytest.raises(ValueError, match="user families"):
+            reg.register_family(
+                ModelFamily(
+                    name="overflow",
+                    pattern=re.compile(r"^overflow-"),
+                    spec_template=ModelSpec(model_id="*"),
+                    description="One too many",
+                )
+            )
+
+    def test_register_family_cap_independent_of_provider_layer(self):
+        """H5: with no provider families, the user can still register up
+        to MAX_USER_FAMILIES — the cap is per-layer."""
+        import re
+
+        from genblaze_core.providers import MAX_USER_FAMILIES, ModelFamily
+
+        reg = ModelRegistry()  # no provider families
+        for i in range(MAX_USER_FAMILIES):
+            reg.register_family(
+                ModelFamily(
+                    name=f"u{i}",
+                    pattern=re.compile(rf"^u{i}-"),
+                    spec_template=ModelSpec(model_id="*"),
+                    description=f"User family {i}",
+                )
+            )
+        assert len(reg._user_families) == MAX_USER_FAMILIES
 
 
 # ------------------------------------------------------------------ prepare_payload
@@ -441,16 +616,14 @@ class TestPreparePayload:
         assert out == {"prompt": "hi", "k": "v"}
 
     def test_aliases_canonical_to_native(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_aliases={"aspect_ratio": "ratio"})}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_aliases={"aspect_ratio": "ratio"}))
         step = _step(model="m", params={"aspect_ratio": "16:9"})
         assert reg.prepare_payload(step) == {"ratio": "16:9"}
 
     def test_native_wins_over_canonical(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_aliases={"aspect_ratio": "ratio"})}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_aliases={"aspect_ratio": "ratio"}))
         step = _step(model="m", params={"aspect_ratio": "16:9", "ratio": "9:16"})
         assert reg.prepare_payload(step) == {"ratio": "9:16"}
 
@@ -460,100 +633,86 @@ class TestPreparePayload:
                 p["size"] = f"{p.pop('resolution')}-{p.pop('aspect_ratio')}"
             return p
 
-        reg = ModelRegistry(defaults={"m": ModelSpec(model_id="m", param_transformer=_xform)})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_transformer=_xform))
         step = _step(model="m", params={"resolution": "1080p", "aspect_ratio": "16:9"})
         out = reg.prepare_payload(step)
         assert out == {"size": "1080p-16:9"}
 
     def test_coercers(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(
-                    model_id="m",
-                    param_coercers={"duration": str, "sound": lambda b: "on" if b else "off"},
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="m",
+                param_coercers={"duration": str, "sound": lambda b: "on" if b else "off"},
+            )
         )
         step = _step(model="m", params={"duration": 5, "sound": True})
         out = reg.prepare_payload(step)
         assert out == {"duration": "5", "sound": "on"}
 
     def test_defaults_fill(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_defaults={"duration": 5})}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_defaults={"duration": 5}))
         assert reg.prepare_payload(_step(model="m")) == {"duration": 5}
 
     def test_defaults_dont_override_user(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_defaults={"duration": 5})}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_defaults={"duration": 5}))
         step = _step(model="m", params={"duration": 10})
         assert reg.prepare_payload(step) == {"duration": 10}
 
     def test_schemas_validate(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(model_id="m", param_schemas={"duration": IntSchema(min=1, max=10)})
-            }
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_schemas={"duration": IntSchema(min=1, max=10)}))
         reg.prepare_payload(_step(model="m", params={"duration": 5}))
         with pytest.raises(ProviderError):
             reg.prepare_payload(_step(model="m", params={"duration": 100}))
 
     def test_required_after_defaults(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(
-                    model_id="m",
-                    param_required=frozenset({"duration"}),
-                    param_defaults={"duration": 5},
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="m",
+                param_required=frozenset({"duration"}),
+                param_defaults={"duration": 5},
+            )
         )
         # default satisfies required
         assert reg.prepare_payload(_step(model="m")) == {"duration": 5}
 
     def test_required_missing_raises(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_required=frozenset({"x"}))}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_required=frozenset({"x"})))
         with pytest.raises(ProviderError, match="Missing required"):
             reg.prepare_payload(_step(model="m"))
 
     def test_constraints(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(model_id="m", param_constraints=(requires_together("a", "b"),))
-            }
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_constraints=(requires_together("a", "b"),)))
         reg.prepare_payload(_step(model="m", params={"a": 1, "b": 2}))
         with pytest.raises(ProviderError):
             reg.prepare_payload(_step(model="m", params={"a": 1}))
 
     def test_allowlist_drops_unknown(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_allowlist=frozenset({"a"}))}
-        )
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", param_allowlist=frozenset({"a"})))
         step = _step(model="m", params={"a": 1, "b": 2})
         assert reg.prepare_payload(step) == {"a": 1}
 
     def test_allowlist_strict_raises(self):
-        reg = ModelRegistry(
-            defaults={"m": ModelSpec(model_id="m", param_allowlist=frozenset({"a"}))},
-            strict_params=True,
-        )
+        reg = ModelRegistry(strict_params=True)
+        reg.register(ModelSpec(model_id="m", param_allowlist=frozenset({"a"})))
         with pytest.raises(ProviderError, match="Unknown parameters"):
             reg.prepare_payload(_step(model="m", params={"a": 1, "b": 2}))
 
     def test_input_mapping_user_wins(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(
-                    model_id="m",
-                    input_mapping=route_images(slots=("image",)),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="m",
+                input_mapping=route_images(slots=("image",)),
+            )
         )
         step = _step(
             model="m",
@@ -564,13 +723,12 @@ class TestPreparePayload:
         assert out["image"] == "user_url"
 
     def test_input_mapping_chain_fills(self):
-        reg = ModelRegistry(
-            defaults={
-                "m": ModelSpec(
-                    model_id="m",
-                    input_mapping=route_images(slots=("first_frame",)),
-                )
-            }
+        reg = ModelRegistry()
+        reg.register(
+            ModelSpec(
+                model_id="m",
+                input_mapping=route_images(slots=("first_frame",)),
+            )
         )
         step = _step(
             model="m",
@@ -589,7 +747,8 @@ class TestComputeCost:
         assert compute_cost(reg, _step()) is None
 
     def test_pricing_applied(self):
-        reg = ModelRegistry(defaults={"m": ModelSpec(model_id="m", pricing=per_unit(0.10))})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", pricing=per_unit(0.10)))
         step = _step(model="m", assets=[Asset(url="u", media_type="image/png")])
         assert compute_cost(reg, step) == pytest.approx(0.10)
 
@@ -597,7 +756,8 @@ class TestComputeCost:
         def bad(_ctx):
             raise RuntimeError("boom")
 
-        reg = ModelRegistry(defaults={"m": ModelSpec(model_id="m", pricing=bad)})
+        reg = ModelRegistry()
+        reg.register(ModelSpec(model_id="m", pricing=bad))
         step = _step(model="m")
         assert compute_cost(reg, step) is None  # swallowed, logged
 
@@ -614,7 +774,9 @@ class TestBaseProviderIntegration:
 
             @classmethod
             def create_registry(cls):
-                return ModelRegistry(defaults={"a-model": ModelSpec(model_id="a-model")})
+                reg = ModelRegistry()
+                reg.register(ModelSpec(model_id="a-model"))
+                return reg
 
             def generate(self, step, config=None):
                 return step
@@ -624,7 +786,9 @@ class TestBaseProviderIntegration:
 
             @classmethod
             def create_registry(cls):
-                return ModelRegistry(defaults={"b-model": ModelSpec(model_id="b-model")})
+                reg = ModelRegistry()
+                reg.register(ModelSpec(model_id="b-model"))
+                return reg
 
             def generate(self, step, config=None):
                 return step
@@ -642,14 +806,15 @@ class TestBaseProviderIntegration:
 
             @classmethod
             def create_registry(cls):
-                return ModelRegistry(defaults={"m": ModelSpec(model_id="m")})
+                reg = ModelRegistry()
+                reg.register(ModelSpec(model_id="m"))
+                return reg
 
             def generate(self, step, config=None):
                 return step
 
-        custom = ModelRegistry(
-            defaults={"custom-m": ModelSpec(model_id="custom-m", pricing=per_unit(9.99))}
-        )
+        custom = ModelRegistry()
+        custom.register(ModelSpec(model_id="custom-m", pricing=per_unit(9.99)))
         p = P(models=custom)
         assert p.models is custom
         assert p.models.has("custom-m")

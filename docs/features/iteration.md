@@ -1,3 +1,4 @@
+<!-- last_verified: 2026-05-07 -->
 # Iteration & Lineage
 
 Every generation should know what came before it. Genblaze tracks iteration history through `parent_run_id` — a field on every run that points to the previous attempt, creating a linked chain of manifests.

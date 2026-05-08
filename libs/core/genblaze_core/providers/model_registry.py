@@ -1,12 +1,11 @@
 """ModelRegistry — layered, thread-safe store of ``ModelSpec`` entries.
 
-Lookup order (post-decoupling, V2):
+Lookup order:
 1. user spec        — exact-match registration via ``register(spec)``
 2. user family      — ``register_family(family)``, prepended (highest priority)
 3. provider family  — connector-shipped ``provider_families=(...)`` tuple
-4. legacy defaults  — transitional ``defaults={}`` shim (removed in PR #13)
-5. discovery cache  — peek-only here (no fetch); NATIVE providers consult it
-6. fallback spec    — permissive pass-through
+4. discovery cache  — peek-only here (no fetch); NATIVE providers consult it
+5. fallback spec    — permissive pass-through
 
 User reads through the family scan are lock-free against the immutable
 ``_provider_families`` tuple; the user-family list is RLock-guarded with
@@ -14,8 +13,7 @@ snapshot reads.
 
 Intended use:
 - Each provider class exposes a ``create_registry()`` classmethod returning
-  a registry built with ``provider_families=(...)`` and (during the
-  migration window) optionally ``defaults={...}``.
+  a registry built with ``provider_families=(...)``.
 - Users register extra slugs / families / pricing either globally (mutate
   the cached default) or per-instance (``fork()`` → ``Provider(models=...)``).
 - Built-in ``prepare_payload(step)`` runs the full parameter pipeline.
@@ -38,6 +36,7 @@ from genblaze_core.models.step import Step
 from genblaze_core.providers.discovery import DiscoveryStatus, _DiscoveryCache
 from genblaze_core.providers.family import (
     MAX_PROVIDER_FAMILIES,
+    MAX_USER_FAMILIES,
     DiscoverySupport,
     FamilyMatch,
     ModelFamily,
@@ -59,10 +58,6 @@ class ModelRegistry:
     """Layered per-provider registry.
 
     Args:
-        defaults: **Transitional shim** (removed in PR #13). Connector-shipped
-            specs keyed by ``model_id``. Resolves between provider families
-            and the discovery cache. New connectors should use
-            ``provider_families=`` instead.
         fallback: Returned from ``get()`` when a model is unknown. Defaults to
             the permissive ``FALLBACK_SPEC`` (no pricing, pass everything).
         provider_families: Connector-shipped pattern-keyed param-shape rules.
@@ -89,7 +84,6 @@ class ModelRegistry:
 
     def __init__(
         self,
-        defaults: Mapping[str, ModelSpec] | None = None,
         fallback: ModelSpec = FALLBACK_SPEC,
         *,
         provider_families: Sequence[ModelFamily] = (),
@@ -111,7 +105,6 @@ class ModelRegistry:
         for family in provider_families:
             _unstable.update(family.unstable_examples)
         self._unstable_slugs: frozenset[str] = frozenset(_unstable)
-        self._defaults: dict[str, ModelSpec] = dict(defaults or {})
         self._user: dict[str, ModelSpec] = {}
         self._provider_families: tuple[ModelFamily, ...] = tuple(provider_families)
         self._user_families: list[ModelFamily] = []
@@ -132,7 +125,7 @@ class ModelRegistry:
     def register(self, spec: ModelSpec, *, override: bool = True) -> None:
         """Add or replace a spec in the user layer."""
         with self._lock:
-            if not override and (spec.model_id in self._user or spec.model_id in self._defaults):
+            if not override and spec.model_id in self._user:
                 raise ValueError(f"Model {spec.model_id!r} already registered; pass override=True")
             self._user[spec.model_id] = spec
             self._rebuild_alias_index()
@@ -140,16 +133,40 @@ class ModelRegistry:
     def register_pricing(self, model_id: str, pricing: PricingStrategy) -> None:
         """Override pricing for a model without touching other fields.
 
-        If the model exists in either layer, a copy with the new pricing is
-        written to the user layer. If unknown, registers a fresh spec with only
-        pricing set (applies via the fallback path).
+        Resolution order for the base spec (before applying pricing):
+
+        1. **User layer** — if the slug is already registered, the
+           existing user spec is the base; only ``pricing`` is replaced.
+        2. **Family resolution** — if the slug matches a connector
+           family but isn't yet user-registered, the family-resolved
+           spec (with all its param contracts: aliases, schemas,
+           coercers, allowlist, input_mapping, extras) is the base.
+           This preserves the family's parameter shape — the user gets
+           pricing layered onto the family's full pipeline rather than
+           a bare permissive spec.
+        3. **Bare ``ModelSpec``** — if neither user nor family covers
+           the slug, a fresh spec with only ``pricing`` set is
+           registered. The slug then resolves through the registry's
+           fallback path with this user-supplied pricing.
+
+        Without step 2, calling ``register_pricing("nvidia/cosmos-...")``
+        on a PARTIAL connector would silently drop the family's param
+        contracts, because the user layer always wins over family
+        resolution in ``get()``.
         """
         with self._lock:
-            existing = self._user.get(model_id) or self._defaults.get(model_id)
+            existing = self._user.get(model_id)
             if existing is None:
-                existing = ModelSpec(model_id=model_id)
+                # Try family resolution to preserve param contracts.
+                # ``match_family`` returns a ``FamilyMatch`` whose
+                # ``spec`` is the family's ``spec_template`` with
+                # ``model_id`` substituted; if no family matches,
+                # fall back to a bare spec.
+                match = self.match_family(model_id)
+                existing = match.spec if match is not None else ModelSpec(model_id=model_id)
             updated = _replace(existing, pricing=pricing)
             self._user[model_id] = updated
+            self._rebuild_alias_index()
 
     def extend(self, specs: Iterable[ModelSpec] | Mapping[str, ModelSpec]) -> None:
         """Bulk-register specs (used by sub-registry composition)."""
@@ -172,8 +189,26 @@ class ModelRegistry:
         ``known_unstable`` hint via ``validate()``. Without this union
         the registry would observe stale state — the family would carry
         unstable_examples but ``validate()`` wouldn't see them.
+
+        **Per-layer cap.** ``MAX_USER_FAMILIES`` (default 32) bounds
+        the user layer's linear-scan cost. The connector-shipped cap
+        (``MAX_PROVIDER_FAMILIES``) is *not* counted here — a connector
+        at its provider cap does not block users from registering
+        their own families. Total scan cost stays under
+        ``MAX_PROVIDER_FAMILIES + MAX_USER_FAMILIES`` patterns.
+
+        Raises:
+            ValueError: when the user-family count is already at
+                ``MAX_USER_FAMILIES``. The error message names the
+                user layer explicitly so the cause is clear.
         """
         with self._lock:
+            if len(self._user_families) >= MAX_USER_FAMILIES:
+                raise ValueError(
+                    f"Registry already has {len(self._user_families)} user families; "
+                    f"cap is {MAX_USER_FAMILIES}. Consolidate patterns or call "
+                    f"fork() to start fresh."
+                )
             self._user_families.insert(0, family)
             if family.unstable_examples:
                 self._unstable_slugs = self._unstable_slugs | frozenset(family.unstable_examples)
@@ -189,7 +224,6 @@ class ModelRegistry:
         """
         with self._lock:
             clone = ModelRegistry(
-                defaults={**self._defaults, **self._user},
                 fallback=self._fallback,
                 provider_families=self._provider_families,
                 # Fork the discovery cache rather than sharing by reference:
@@ -203,11 +237,24 @@ class ModelRegistry:
                 # family.unstable_examples (idempotent — frozenset union).
                 unstable_slugs=self._unstable_slugs,
             )
+            # Carry the user layer over. ``extend`` performs a single bulk
+            # write under its own lock and does one alias-index rebuild —
+            # cheaper than N ``register()`` calls. Direct dict assignment
+            # would skip the rebuild entirely; extend is the right shape.
+            if self._user:
+                clone.extend(self._user.values())
             # User families are part of the user layer — copy them over.
             # Their unstable_examples are already in self._unstable_slugs
             # which we passed above, so this re-population doesn't lose
             # any signal.
             clone._user_families = list(self._user_families)
+            # Carry the once-per-slug deprecation-warning state. Without
+            # this, a fork-per-request multi-tenant deployment would
+            # re-warn on every request for the same deprecated alias —
+            # exactly the spam ``_warned_deprecated`` was designed to
+            # prevent. The set is shallow-copied so future warnings on
+            # the clone don't leak back to the parent.
+            clone._warned_deprecated = set(self._warned_deprecated)
             return clone
 
     # --- read ---------------------------------------------------------------
@@ -215,12 +262,12 @@ class ModelRegistry:
     def get(self, model_id: str) -> ModelSpec:
         """Return the matching spec; falls back to family → alias → ``fallback``.
 
-        Resolution order: user spec → legacy defaults shim → user family →
-        provider family → alias → deprecated alias → fallback. Emits
-        ``DeprecationWarning`` when the lookup resolves via a
-        ``deprecated_aliases`` entry. Never returns ``None``.
+        Resolution order: user spec → user family → provider family → alias
+        → deprecated alias → fallback. Emits ``DeprecationWarning`` when the
+        lookup resolves via a ``deprecated_aliases`` entry. Never returns
+        ``None``.
         """
-        spec = self._user.get(model_id) or self._defaults.get(model_id)
+        spec = self._user.get(model_id)
         if spec is not None:
             return spec
         # Family resolution — second tier; pattern match returns the
@@ -230,12 +277,12 @@ class ModelRegistry:
             return match.spec
         canonical = self._alias_index.get(model_id)
         if canonical is not None:
-            spec = self._user.get(canonical) or self._defaults.get(canonical)
+            spec = self._user.get(canonical)
             if spec is not None:
                 return spec
         deprecated_canonical = self._deprecated_alias_index.get(model_id)
         if deprecated_canonical is not None:
-            spec = self._user.get(deprecated_canonical) or self._defaults.get(deprecated_canonical)
+            spec = self._user.get(deprecated_canonical)
             if spec is not None:
                 if model_id not in self._warned_deprecated:
                     self._warned_deprecated.add(model_id)
@@ -293,14 +340,6 @@ class ModelRegistry:
         # 1. user spec — strongest signal regardless of provider class.
         if model_id in self._user:
             return ValidationResult.ok_authoritative(ValidationSource.USER)
-        if model_id in self._defaults:
-            # Legacy defaults shim: a connector author's curated spec is
-            # treated as authoritative — it's the same shape user
-            # registration takes after migration.
-            return ValidationResult.ok_authoritative(
-                ValidationSource.USER,
-                detail="from legacy defaults shim (transitional)",
-            )
 
         # 2. Family match → consult discovery cache (peek, no fetch).
         match = self.match_family(model_id)
@@ -382,7 +421,7 @@ class ModelRegistry:
         """All registered / discoverable model IDs, sorted.
 
         Includes:
-        - user-registered slugs and legacy defaults,
+        - user-registered slugs,
         - ``example_slugs`` from every registered family (documentation hint),
         - the most-recent discovery cache snapshot (if any).
 
@@ -391,7 +430,7 @@ class ModelRegistry:
         ``validate()``; this method exists for IDE autocomplete, doc
         generation, and capability advertising.
         """
-        seen: set[str] = set(self._defaults) | set(self._user)
+        seen: set[str] = set(self._user)
         for family in self._provider_families:
             seen.update(family.example_slugs)
         with self._lock:
@@ -406,13 +445,12 @@ class ModelRegistry:
         """True if the model_id (or alias / family pattern) is non-fallback.
 
         Coherent with ``__contains__`` and ``validate(...).is_ok``: returns
-        ``True`` for any slug that resolves via user spec, legacy defaults,
-        family pattern, alias, or deprecated alias. Returns ``False`` for
-        the permissive fallback.
+        ``True`` for any slug that resolves via user spec, family pattern,
+        alias, or deprecated alias. Returns ``False`` for the permissive
+        fallback.
         """
         if (
             model_id in self._user
-            or model_id in self._defaults
             or model_id in self._alias_index
             or model_id in self._deprecated_alias_index
         ):
@@ -422,11 +460,15 @@ class ModelRegistry:
     def items(self) -> Iterator[tuple[str, ModelSpec]]:
         """Iterate over ``(model_id, spec)`` pairs in deterministic order.
 
-        User overrides take precedence over package defaults, matching ``get``.
-        Aliases are not yielded — only canonical ids appear.
+        Aliases are not yielded — only canonical ids appear. Family-only
+        slugs surfaced via ``known()`` (e.g., ``example_slugs`` or discovery
+        cache entries that aren't user-registered) are intentionally
+        skipped: ``items()`` returns concrete ``ModelSpec`` objects, and
+        family resolution requires a slug to construct one. Callers needing
+        the family-resolved spec should call ``get(slug)`` directly.
         """
         for model_id in self.known():
-            spec = self._user.get(model_id) or self._defaults.get(model_id)
+            spec = self._user.get(model_id)
             if spec is not None:
                 yield model_id, spec
 
@@ -569,12 +611,11 @@ class ModelRegistry:
     def _rebuild_alias_index(self) -> None:
         idx: dict[str, str] = {}
         dep_idx: dict[str, str] = {}
-        for layer in (self._defaults, self._user):
-            for model_id, spec in layer.items():
-                for alias in spec.aliases:
-                    idx[alias] = model_id
-                for alias in spec.deprecated_aliases:
-                    dep_idx[alias] = model_id
+        for model_id, spec in self._user.items():
+            for alias in spec.aliases:
+                idx[alias] = model_id
+            for alias in spec.deprecated_aliases:
+                dep_idx[alias] = model_id
         self._alias_index = idx
         self._deprecated_alias_index = dep_idx
 

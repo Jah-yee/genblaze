@@ -92,7 +92,7 @@ class LMNTProvider(SyncProvider):
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        return ModelRegistry(defaults={}, fallback=_LMNT_FALLBACK_SPEC)
+        return ModelRegistry(fallback=_LMNT_FALLBACK_SPEC)
 
     def get_capabilities(self) -> ProviderCapabilities:
         """LMNT: low-latency text-to-speech generation."""
@@ -109,8 +109,18 @@ class LMNTProvider(SyncProvider):
         *,
         models: ModelRegistry | None = None,
         retry_policy: RetryPolicy | None = None,
+        probe_cache_ttl: float | None = None,
+        probe_cache_max_entries: int | None = None,
     ):
-        super().__init__(models=models, retry_policy=retry_policy)
+        # probe_cache_* are no-ops on this NONE-discovery provider; accepted
+        # for API uniformity so calling code can pass them to any provider
+        # without TypeError.
+        super().__init__(
+            models=models,
+            retry_policy=retry_policy,
+            probe_cache_ttl=probe_cache_ttl,
+            probe_cache_max_entries=probe_cache_max_entries,
+        )
         self._api_key = api_key
         self._output_dir = Path(output_dir) if output_dir else None
         self._speech_client: Any = None

@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-04-25 -->
+<!-- last_verified: 2026-05-07 -->
 <h1 align="center" style="border-bottom: none">
     Genblaze
 </h1>
@@ -201,23 +201,26 @@ You can also pass any key explicitly to the provider or backend constructor (e.g
 
 ## Custom models & pricing
 
-Every provider exposes a `ModelRegistry` you can extend at runtime. Use any model the provider supports — even ones Genblaze hasn't shipped defaults for — and plug in your own pricing.
+Every provider exposes a `ModelRegistry` you can extend at runtime. Connectors ship pattern-keyed `ModelFamily` rules — any slug fitting an existing family pattern works the day it ships upstream, with no SDK release required. Pricing is **user-registered** (the SDK ships zero hardcoded prices as of 0.3.0); copy a recipe from [`docs/reference/pricing-recipes.md`](docs/reference/pricing-recipes.md).
 
 ```python
 from genblaze_core.providers import ModelSpec, per_unit
 from genblaze_openai import DalleProvider
 
-# Override pricing on a known model (e.g. your volume-discount rate)
 reg = DalleProvider.models_default().fork()
-reg.register_pricing("dall-e-3", per_unit(0.050))
 
-# Register a brand-new model the library hasn't seen yet
+# Register pricing for a known model (your volume rate, or just the list rate)
+reg.register_pricing("dall-e-3", per_unit(0.040))
+
+# Register a brand-new model that doesn't fit any shipped family pattern
 reg.register(ModelSpec(model_id="gpt-image-3-preview", pricing=per_unit(0.20)))
 
 provider = DalleProvider(models=reg)
 ```
 
-Unknown models pass through by default (`cost_usd=None` until registered). No release required to adopt a newly-released model. See [`docs/features/model-registry.md`](docs/features/model-registry.md) for param aliases, schemas, and input routing.
+Unknown models pass through with `cost_usd=None` until you register pricing. See [`docs/features/model-registry.md`](docs/features/model-registry.md) for the full `ModelFamily` / `ModelSpec` surface (param aliases, schemas, input routing, validation outcomes).
+
+> **Upgrading from 0.2.x?** Pricing tables moved out of the SDK and `ModelRegistry(defaults={...})` is no longer accepted. See [`docs/guides/migrating-to-0.3.md`](docs/guides/migrating-to-0.3.md) for the upgrade walkthrough.
 
 ## Storage
 

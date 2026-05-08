@@ -37,7 +37,7 @@ from genblaze_core.providers.retry import retry_after_from_response
 from genblaze_core.runnable.config import RunnableConfig
 
 from genblaze_google._errors import map_google_error
-from genblaze_google._families import GOOGLE_VEO_FAMILY
+from genblaze_google._families import GOOGLE_VEO_FAMILY, GOOGLE_VEO_LEGACY_FAMILY
 
 _FALLBACK = ModelSpec(model_id="*", modality=Modality.VIDEO)
 
@@ -72,8 +72,13 @@ class VeoProvider(BaseProvider):
 
     @classmethod
     def create_registry(cls) -> ModelRegistry:
+        # Order is load-bearing: legacy first, modern catch-all second.
+        # ``ModelRegistry.match_family`` is first-match-wins, so a
+        # ``veo-2.0-*`` slug must match ``GOOGLE_VEO_LEGACY_FAMILY``
+        # (no audio) before falling through to ``GOOGLE_VEO_FAMILY``
+        # (which carries ``extras["has_audio"]=True``).
         return ModelRegistry(
-            provider_families=(GOOGLE_VEO_FAMILY,),
+            provider_families=(GOOGLE_VEO_LEGACY_FAMILY, GOOGLE_VEO_FAMILY),
             fallback=_FALLBACK,
         )
 
@@ -245,8 +250,14 @@ class VeoProvider(BaseProvider):
             if response is None or not hasattr(response, "generated_videos"):
                 raise ProviderError("No video generated in response")
 
-            # Veo 3.0 models generate audio alongside video
-            is_veo3 = step.model.startswith("veo-3")
+            # Audio capability comes from the family's typed ``extras``,
+            # not a runtime string check on the slug. Veo 2 routes to
+            # ``GOOGLE_VEO_LEGACY_FAMILY`` (no ``has_audio``); Veo 3+
+            # routes to ``GOOGLE_VEO_FAMILY`` (``extras["has_audio"]=True``).
+            # Future ``veo-N`` slugs inherit modern's audio capability
+            # automatically — no provider release required.
+            spec = self._models.get(step.model)
+            has_audio = bool(spec.extras.get("has_audio"))
 
             for gv in response.generated_videos:
                 video = gv.video
@@ -256,13 +267,14 @@ class VeoProvider(BaseProvider):
                 video_uri = getattr(video, "uri", None)
                 if video_uri:
                     validate_asset_url(video_uri)
-                    vm_kwargs: dict[str, Any] = {"has_audio": is_veo3}
+                    vm_kwargs: dict[str, Any] = {"has_audio": has_audio}
                     if "resolution" in step.params:
                         vm_kwargs["resolution"] = step.params["resolution"]
                     asset = Asset(url=video_uri, media_type="video/mp4")
                     asset.video = VideoMetadata(**vm_kwargs)
-                    # Multi-track metadata for Veo 3 (video + generated audio)
-                    if is_veo3:
+                    # Multi-track metadata for audio-capable variants
+                    # (video + generated audio)
+                    if has_audio:
                         asset.tracks = [
                             Track(kind="video", codec="h264"),
                             Track(kind="audio", codec="aac", label="generated-audio"),

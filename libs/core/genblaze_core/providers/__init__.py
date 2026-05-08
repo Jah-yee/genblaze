@@ -22,6 +22,7 @@ from genblaze_core.providers.discovery import (
 )
 from genblaze_core.providers.family import (
     MAX_PROVIDER_FAMILIES,
+    MAX_USER_FAMILIES,
     DiscoverySupport,
     FamilyMatch,
     FamilyProbe,
@@ -96,6 +97,7 @@ __all__ = [
     "FALLBACK_SPEC",
     "MAX_PROVIDER_FAMILIES",
     "MAX_RETRY_AFTER_SEC",
+    "MAX_USER_FAMILIES",
     "PRE_RESPONSE_EXCEPTIONS",
     "ArraySchema",
     "BaseProvider",

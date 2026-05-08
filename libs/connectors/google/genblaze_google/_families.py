@@ -74,28 +74,73 @@ def _check_imagen_aspect_ratio(params: dict[str, Any]) -> None:
 
 # --- Families -------------------------------------------------------------
 
-GOOGLE_VEO_FAMILY = ModelFamily(
-    name="google-veo",
-    pattern=re.compile(r"^veo-"),
+# Shared param contract for all Veo variants — duration alias / coercer
+# / constraints are identical across legacy and modern. Only ``extras``
+# differs (audio capability).
+_VEO_PARAM_CONTRACT: dict = {
+    # Standard "duration" maps to Veo-native "duration_seconds".
+    "param_aliases": {"duration": "duration_seconds"},
+    # Veo expects "4"/"6"/"8" string form.
+    "param_coercers": {"duration_seconds": str},
+    "param_constraints": (
+        _check_veo_aspect_ratio,
+        _check_veo_resolution,
+        _check_veo_duration,
+    ),
+}
+
+
+# Veo 2 — text-to-video only, NO synchronized audio. Pattern is tightly
+# bound to ``^veo-2[.-]`` so ``veo-2.0-generate-001`` and a hypothetical
+# ``veo-2-pro`` both match here, but ``veo-3.x``, ``veo-4.x``, and any
+# future major versions fall through to ``GOOGLE_VEO_FAMILY``.
+#
+# Order matters: this family is listed FIRST in
+# ``provider.py::create_registry`` so the legacy pattern wins on
+# first-match for every veo-2 slug. The catch-all ``^veo-`` family
+# only applies to slugs that didn't match here.
+GOOGLE_VEO_LEGACY_FAMILY = ModelFamily(
+    name="google-veo-legacy",
+    # ``[.-]`` matches the standard separator after the major version
+    # (``veo-2.0-...`` / ``veo-2-pro``). The trailing ``$`` accepts the
+    # bare ``veo-2`` slug too — without it, a programmatic lookup of
+    # the bare slug would fall through to the modern catch-all and
+    # silently inherit ``has_audio=True``.
+    pattern=re.compile(r"^veo-2(?:[.-]|$)"),
     spec_template=ModelSpec(
         model_id="*",
         modality=Modality.VIDEO,
-        # Standard "duration" maps to Veo-native "duration_seconds".
-        param_aliases={"duration": "duration_seconds"},
-        # Veo expects "4"/"6"/"8" string form.
-        param_coercers={"duration_seconds": str},
-        param_constraints=(
-            _check_veo_aspect_ratio,
-            _check_veo_resolution,
-            _check_veo_duration,
-        ),
+        **_VEO_PARAM_CONTRACT,
     ),
     description=(
-        "Google Veo family — text/image-to-video generation. Veo 3 variants "
-        "additionally render synchronized audio."
+        "Google Veo 2 — text-to-video generation. Does not render "
+        "synchronized audio (use Veo 3+ via ``GOOGLE_VEO_FAMILY``)."
+    ),
+    example_slugs=("veo-2.0-generate-001",),
+    probe=google_models_get_probe,
+)
+
+
+# Veo 3+ — catch-all for non-legacy ``^veo-`` slugs. Includes
+# synchronized audio. ``extras["has_audio"]`` is the typed signal the
+# provider reads to populate ``VideoMetadata.has_audio`` and the
+# multi-track asset metadata (replaces the legacy
+# ``step.model.startswith("veo-3")`` string check).
+GOOGLE_VEO_FAMILY = ModelFamily(
+    name="google-veo",
+    pattern=re.compile(r"^veo-"),  # catches everything not legacy
+    spec_template=ModelSpec(
+        model_id="*",
+        modality=Modality.VIDEO,
+        extras={"has_audio": True},
+        **_VEO_PARAM_CONTRACT,
+    ),
+    description=(
+        "Google Veo 3+ — text/image-to-video generation with "
+        "synchronized audio. Catches every ``veo-`` slug not matched "
+        "by ``GOOGLE_VEO_LEGACY_FAMILY``."
     ),
     example_slugs=(
-        "veo-2.0-generate-001",
         "veo-3.0-generate-001",
         "veo-3.0-fast-generate-001",
     ),
@@ -120,4 +165,8 @@ GOOGLE_IMAGEN_FAMILY = ModelFamily(
 )
 
 
-__all__ = ["GOOGLE_VEO_FAMILY", "GOOGLE_IMAGEN_FAMILY"]
+__all__ = [
+    "GOOGLE_IMAGEN_FAMILY",
+    "GOOGLE_VEO_FAMILY",
+    "GOOGLE_VEO_LEGACY_FAMILY",
+]

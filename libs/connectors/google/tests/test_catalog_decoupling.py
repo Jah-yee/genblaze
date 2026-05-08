@@ -62,24 +62,92 @@ class TestDiscoverySupportDeclarations:
 
 
 class TestVeoFamily:
-    def test_current_models_match(self) -> None:
+    def test_legacy_veo_2_routes_to_legacy_family(self) -> None:
+        """veo-2.x slugs match ``google-veo-legacy`` (no audio).
+
+        Includes the bare ``veo-2`` form to pin the trailing ``|$``
+        anchor on the pattern — without it, the bare slug would fall
+        through to the modern catch-all and incorrectly inherit
+        ``has_audio=True``.
+        """
+        from genblaze_google import VeoProvider
+
+        provider = VeoProvider(api_key="test")
+        for slug in ("veo-2", "veo-2.0-generate-001", "veo-2-pro", "veo-2.5-pro"):
+            match = provider._models.match_family(slug)
+            assert match is not None, slug
+            assert match.family.name == "google-veo-legacy", slug
+            # Legacy never carries has_audio.
+            assert "has_audio" not in match.spec.extras, slug
+
+    def test_modern_veo_3plus_routes_to_modern_family(self) -> None:
+        """veo-3.x and beyond match ``google-veo`` (catch-all with audio)."""
         from genblaze_google import VeoProvider
 
         provider = VeoProvider(api_key="test")
         for slug in (
-            "veo-2.0-generate-001",
             "veo-3.0-generate-001",
             "veo-3.0-fast-generate-001",
         ):
             match = provider._models.match_family(slug)
-            assert match is not None and match.family.name == "google-veo", slug
+            assert match is not None, slug
+            assert match.family.name == "google-veo", slug
 
-    def test_future_variants_inherit(self) -> None:
+    def test_legacy_family_lacks_has_audio(self) -> None:
+        """B3 invariant: Veo 2 spec_template carries no ``has_audio`` flag,
+        so the provider populates ``VideoMetadata.has_audio=False``."""
         from genblaze_google import VeoProvider
 
         provider = VeoProvider(api_key="test")
-        for slug in ("veo-4.0-generate-001", "veo-3.0-ultra-generate-002"):
-            assert provider._models.match_family(slug) is not None, slug
+        spec = provider._models.get("veo-2.0-generate-001")
+        assert "has_audio" not in spec.extras
+        # Provider's bool() coercion produces False for missing key.
+        assert bool(spec.extras.get("has_audio")) is False
+
+    def test_modern_family_carries_has_audio(self) -> None:
+        """B3 invariant: every veo-3+ slug inherits ``extras['has_audio']=True``
+        from the modern family — replaces the legacy ``startswith('veo-3')`` check."""
+        from genblaze_google import VeoProvider
+
+        provider = VeoProvider(api_key="test")
+        for slug in (
+            "veo-3.0-generate-001",
+            "veo-3.0-fast-generate-001",
+        ):
+            spec = provider._models.get(slug)
+            assert spec.extras.get("has_audio") is True, slug
+
+    def test_future_variants_inherit_audio_via_modern_family(self) -> None:
+        """Future ``veo-N`` slugs (N>=3) match the modern catch-all and
+        inherit ``has_audio=True`` automatically — no provider release
+        required when Google ships a new major version."""
+        from genblaze_google import VeoProvider
+
+        provider = VeoProvider(api_key="test")
+        for slug in (
+            "veo-4.0-generate-001",
+            "veo-3.0-ultra-generate-002",
+            "veo-9-experimental",
+        ):
+            match = provider._models.match_family(slug)
+            assert match is not None, slug
+            assert match.family.name == "google-veo", slug
+            assert match.spec.extras.get("has_audio") is True, slug
+
+    def test_family_ordering_legacy_first(self) -> None:
+        """B3 invariant: ``provider_families`` lists legacy BEFORE modern
+        so first-match-wins routes veo-2.* correctly. If the catch-all
+        ``^veo-`` came first, veo-2.0 would silently get ``has_audio=True``."""
+        from genblaze_google import VeoProvider
+
+        provider = VeoProvider(api_key="test")
+        family_names = [f.name for f in provider._models.families]
+        legacy_idx = family_names.index("google-veo-legacy")
+        modern_idx = family_names.index("google-veo")
+        assert legacy_idx < modern_idx, (
+            f"google-veo-legacy must come before google-veo in resolution order; "
+            f"got {family_names}"
+        )
 
     def test_imagen_and_gemini_slugs_dont_match(self) -> None:
         from genblaze_google import VeoProvider

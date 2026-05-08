@@ -1,3 +1,4 @@
+<!-- last_verified: 2026-05-07 -->
 # Adding a New Provider
 
 Step-by-step guide for contributing a provider adapter to genblaze. This guide is the canonical contract — every section maps to a check the compliance harness or pipeline relies on.
@@ -48,7 +49,7 @@ libs/connectors/myprovider/
 
 ## 2. Set up pyproject.toml
 
-Match the layout used by the other connectors so packaging, classifiers, and discovery are consistent. The `genblaze-core` constraint must track the **current** core minor (`>=0.2.0,<0.3` at the time of writing — confirm against a sibling connector).
+Match the layout used by the other connectors so packaging, classifiers, and discovery are consistent. The `genblaze-core` constraint must track the **current** core minor (`>=0.3.0,<0.4` at the time of writing — confirm against a sibling connector).
 
 ```toml
 [build-system]
@@ -69,7 +70,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "genblaze-core>=0.2.0,<0.3",
+    "genblaze-core>=0.3.0,<0.4",
     "myprovider-sdk>=1.0",
 ]
 
@@ -341,30 +342,139 @@ def list_voices(self, *, model=None, language=None):
     return [Voice(...) for v in voices if _matches(v, model, language)]
 ```
 
-## 11. Cost tracking
+## 11. Declare your model families and DiscoverySupport
 
-Pricing is declared **per model** on `ModelSpec.pricing`. The base class runs the strategy after `fetch_output()` and sets `step.cost_usd` — your connector doesn't compute cost itself. Expose your specs via `create_registry()`:
+As of `genblaze-core` 0.3.0, connectors ship **pattern-keyed `ModelFamily`
+rules**, not slug lists. A new vendor model that fits an existing family
+pattern works the day it ships upstream — no SDK release required.
+Connectors also declare their `DiscoverySupport` tier so preflight knows
+what `validate_model()` can authoritatively say.
+
+### 11.1 Declare a family per model line
 
 ```python
+import re
+from genblaze_core.models.enums import Modality
 from genblaze_core.providers import (
-    BaseProvider, ModelRegistry, ModelSpec, per_unit,
+    BaseProvider,
+    DiscoverySupport,
+    ModelFamily,
+    ModelRegistry,
+    ModelSpec,
 )
 
-def _build_registry() -> ModelRegistry:
-    return ModelRegistry(
-        defaults={
-            "my-model-v1": ModelSpec(model_id="my-model-v1", pricing=per_unit(0.10)),
-            "my-model-v2": ModelSpec(model_id="my-model-v2", pricing=per_unit(0.25)),
-        },
-    )
+_MYPROVIDER_VIDEO_FAMILY = ModelFamily(
+    name="myprovider-video",
+    pattern=re.compile(r"^myvendor-video-"),
+    spec_template=ModelSpec(
+        model_id="*",
+        modality=Modality.VIDEO,
+        param_aliases={"aspect_ratio": "ratio"},
+        # ... other param contracts inherited by every matched slug
+    ),
+    description="MyVendor video family — text-to-video and image-to-video.",
+    example_slugs=("myvendor-video-pro", "myvendor-video-fast"),
+)
+
 
 class MyProvider(BaseProvider):
+    name = "myprovider"
+    discovery_support = DiscoverySupport.NATIVE  # see decision tree below
+
     @classmethod
     def create_registry(cls) -> ModelRegistry:
-        return _build_registry()
+        return ModelRegistry(
+            provider_families=(_MYPROVIDER_VIDEO_FAMILY,),
+            fallback=ModelSpec(model_id="*", modality=Modality.VIDEO),
+        )
 ```
 
-Packaged pricing helpers cover the common shapes:
+**Pattern style:** anchor with `^`, prefer non-capturing groups, avoid
+nested unbounded quantifiers. The constructor rejects unsafe patterns
+via `pattern_safety.assert_safe()`. Cap is `MAX_PROVIDER_FAMILIES = 32`
+per registry.
+
+**`spec_template.pricing` must be `None`.** Pricing is user-registered
+via `register_pricing()`; shipping it on the family was the rot vector
+0.3.0 eliminated.
+
+### 11.2 Choose your `DiscoverySupport` tier
+
+| Tier | Pick when | What it costs you |
+|---|---|---|
+| `NATIVE` | Vendor exposes a cheap, authoritative `GET /models` (or equivalent). The catalog covers every endpoint your connector targets | Implement `_fetch_models()` returning `Iterable[str]`; the base class wires the discovery cache and returns `OK_AUTHORITATIVE` for cache-confirmed slugs |
+| `PARTIAL` | No global catalog, but you can probe a single slug cheaply (HEAD on a model URL, `client.models.get`, or the empty-payload-POST trick) | Attach a `FamilyProbe` to each `ModelFamily` and override `_invoke_family_probe()` to forward your transport. Probes must be polite (no token spend, no audit-log records) |
+| `NONE` | Vendor SDK exposes no per-slug check, or every probe enqueues a billable generation. Catalog is small and stable | Nothing extra. Family-matched slugs return `OK_PROVISIONAL`; unmatched slugs return `NOT_FOUND`. End users see one WARN at preflight per pipeline |
+
+Decision shortcuts:
+
+- Vendor SDK has `client.models.list()` or `client.models.get()`? **NATIVE** (or PARTIAL with the `models.get` probe).
+- Vendor REST API has `/v1/models` returning your endpoint's slugs? **NATIVE**.
+- Vendor REST API takes raw POST and returns 404 on dead slugs? **PARTIAL** with the empty-payload-POST trick (see `genblaze_nvidia._probe.empty_payload_genai_probe`).
+- None of the above? **NONE.** Document the rationale in a class docstring and move on. NONE is honest about what the SDK can verify.
+
+### 11.3 PARTIAL probe — wire the transport
+
+```python
+from typing import Any
+from genblaze_core.providers import LiveProbeResult
+
+
+class MyPartialProvider(BaseProvider):
+    discovery_support = DiscoverySupport.PARTIAL
+
+    def _invoke_family_probe(self, probe: Any, model_id: str) -> LiveProbeResult:
+        """Forward the family probe with this provider's transport."""
+        return probe(model_id, http=self._client.http())  # or client=..., etc.
+```
+
+`FamilyProbe` is typed as `Callable[..., LiveProbeResult]` — your probe
+chooses its keyword shape. The first positional is always the slug; the
+return is always a `LiveProbeResult` (`LIVE` / `DEAD` / `UNKNOWN`).
+
+Probe results are cached per-provider via a single-flight
+`threading.Event`, TTL-bounded
+(`PROBE_CACHE_TTL_SECONDS=3600`), with FIFO eviction at
+`PROBE_CACHE_MAX_ENTRIES=256`. Per-instance overrides:
+`Provider(probe_cache_ttl=..., probe_cache_max_entries=...)`.
+
+### 11.4 NATIVE discovery — the `_fetch_models()` hook
+
+```python
+class MyNativeProvider(BaseProvider):
+    discovery_support = DiscoverySupport.NATIVE
+
+    def _fetch_models(self) -> list[str]:
+        """Authoritative slug list for this connector's surface.
+
+        Filter the upstream catalog by your family pattern so cross-modality
+        slugs (chat / embeddings) don't pollute your TTS/Image/Video cache.
+        """
+        upstream = self._client.models.list()
+        family_pattern = _MYPROVIDER_FAMILY.pattern
+        return [m.id for m in upstream.data if family_pattern.match(m.id)]
+```
+
+The base class calls `_fetch_models()` lazily — first `validate_model()`
+call after a TTL expiry triggers a single-flight refresh. Concurrent
+calls share the same fetch.
+
+### 11.5 Cost tracking — pricing recipes
+
+The SDK ships **zero** hardcoded prices. Pricing tables live in
+[`docs/reference/pricing-recipes.md`](../reference/pricing-recipes.md) —
+when your connector ships, add a section there with the canonical
+strategy shape and the upstream pricing URL.
+
+Connectors do **not** set `pricing=` on the family `spec_template`
+(the constructor rejects this). Users register pricing at runtime:
+
+```python
+provider = MyProvider(api_key="...")
+provider.models.register_pricing("myvendor-video-pro", per_unit(0.25))
+```
+
+Packaged strategies cover the common shapes:
 
 | Shape | Helper |
 |---|---|
@@ -378,13 +488,19 @@ Packaged pricing helpers cover the common shapes:
 | Pull from response | `per_response_metric(lambda ctx: ctx.provider_payload[...])` |
 | Try strategies in order, first non-`None` wins | `first_match(table_strategy, per_unit_fallback)` |
 
-For anything else, write a `PricingStrategy` callable — `Callable[[PricingContext], float | None]`. Keep it pure and synchronous (no I/O).
+For anything else, write a `PricingStrategy` callable —
+`Callable[[PricingContext], float | None]`. Keep it pure and synchronous
+(no I/O).
 
-**Unknown models** (newly-released, snapshots, aliases) fall back to the permissive default spec — the request goes through, `cost_usd=None`. Users can add pricing at runtime via `MyProvider.models_default().fork().register_pricing(...)` — no provider release required.
+**Free upfront estimate** — once a user registers `pricing`, callers
+get `provider.estimate_cost(model, params, n=1) -> Decimal | None` for
+free. It synthesizes a fake step + asset(s) so per-unit / per-second /
+param-based strategies work without an API call. Returns `None` for
+response-only strategies (e.g. `per_response_metric`) — callers fall
+back to "varies."
 
-**Free upfront estimate** — once `pricing` is wired, callers get `provider.estimate_cost(model, params, n=1) -> Decimal | None` for free. It synthesizes a fake step + asset(s) so per-unit / per-second / param-based strategies work without an API call. Returns `None` for response-only strategies (e.g. `per_response_metric`) — callers fall back to "varies."
-
-See [`docs/features/model-registry.md`](../features/model-registry.md) for the full `ModelSpec` surface (param aliases, schemas, input routing).
+See [`docs/features/model-registry.md`](../features/model-registry.md)
+for the full `ModelFamily` / `ModelSpec` surface.
 
 ## 12. Poll result caching (BaseProvider only)
 
@@ -471,13 +587,11 @@ def poll_progress(self, prediction_id):
     }
 ```
 
-## 16. Optional: preflight + probe hooks
+## 16. Optional: preflight auth hook
 
-Two opt-in hooks make connectors more operable in production. Override only when the provider exposes a cheap endpoint you can target.
-
-### `preflight_auth(*, timeout=5.0)`
-
-Runs once per provider instance before the first `submit()`. Surface bad credentials in **milliseconds** instead of after a 120-second `submit` hang. Implementations should:
+`preflight_auth(*, timeout=5.0)` runs once per provider instance before
+the first `submit()`. Surface bad credentials in **milliseconds**
+instead of after a 120-second `submit` hang. Implementations should:
 
 - Hit a known-cheap endpoint (e.g. `GET /me`, `GET /requests`)
 - Raise `ProviderError(error_code=AUTH_FAILURE)` on rejection
@@ -486,9 +600,13 @@ Runs once per provider instance before the first `submit()`. Surface bad credent
 
 Reference: `libs/connectors/gmicloud/genblaze_gmicloud/_base.py::preflight_auth`.
 
-### `probe_model(model_id) -> ProbeResult`
-
-Liveness probe for one model ID. [`tools/probe_models.py`](../../tools/probe_models.py) runs this in CI to detect when a registered model has been removed upstream. Use `ProbeResult.ok()`, `not_found()`, `auth()`, `unknown()`, or `skipped()`. Default is `skipped()` — opt in only if you have a cheap, idempotent way to ask "does this model exist?".
+> **Note:** The legacy `probe_model(model_id) → ProbeResult` hook is
+> deprecated as of 0.3.0. Liveness probing is now expressed as a
+> `FamilyProbe` attached to each `ModelFamily` (see §11.3). The
+> `tools/probe_models.py` CI tool still runs against the new shape via
+> the deprecation adapter, but new connectors should declare a
+> `FamilyProbe` directly — the per-family probe is more granular and
+> the result feeds the registry's authoritative `validate_model()`.
 
 ## 17. Optional: tune retry behavior
 
@@ -560,7 +678,7 @@ pip install -e "libs/connectors/myprovider[dev]"
 **Packaging**
 - [ ] Package at `libs/connectors/myprovider/` with `genblaze_myprovider/` and `tests/`
 - [ ] `pyproject.toml` with `genblaze.providers` entry point and `py.typed` marker shipped in the wheel
-- [ ] `genblaze-core>=0.2.0,<0.3` (or current minor) in dependencies
+- [ ] `genblaze-core>=0.3.0,<0.4` (or current minor) in dependencies
 
 **Provider class**
 - [ ] Subclass `SyncProvider` (preferred) or `BaseProvider` (polling APIs only)

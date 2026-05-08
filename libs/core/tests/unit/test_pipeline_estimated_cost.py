@@ -21,11 +21,8 @@ from genblaze_core.testing import MockProvider
 def _provider_with_priced_models(rates: dict[str, float]) -> MockProvider:
     """MockProvider whose registry has flat per-unit pricing for each model."""
     p = MockProvider()
-    reg = ModelRegistry(
-        defaults={
-            mid: ModelSpec(model_id=mid, pricing=per_unit(rate)) for mid, rate in rates.items()
-        }
-    )
+    reg = ModelRegistry()
+    reg.extend(ModelSpec(model_id=mid, pricing=per_unit(rate)) for mid, rate in rates.items())
     p._models = reg
     return p
 
@@ -77,6 +74,8 @@ def test_estimate_cost_passes_duration_to_per_second_pricing() -> None:
         return _strategy
 
     p = MockProvider()
-    p._models = ModelRegistry(defaults={"v1": ModelSpec(model_id="v1", pricing=per_second(0.05))})
+    reg = ModelRegistry()
+    reg.register(ModelSpec(model_id="v1", pricing=per_second(0.05)))
+    p._models = reg
     assert p.estimate_cost("v1", params={"duration": 10}) == Decimal("0.5")
     assert p.estimate_cost("v1") is None  # missing duration → None

@@ -1,4 +1,4 @@
-<!-- last_verified: 2026-04-24 -->
+<!-- last_verified: 2026-05-07 -->
 # genblaze-nvidia
 
 NVIDIA NIM / [build.nvidia.com](https://build.nvidia.com/models) provider adapters for
@@ -192,16 +192,28 @@ client-side and pass each one as `Asset(media_type="image/png")`.
 
 ## Models
 
-Curated entries encode per-model behavior (SDXL's `text_prompts` shape,
-canonical→native param aliases). Any model NVIDIA ships that isn't listed
-still works via the permissive fallback spec — no release needed.
+`genblaze-nvidia` ships pattern-keyed `ModelFamily` rules — each
+family encodes the per-line param shape (SDXL's `text_prompts`,
+Cosmos's `width`/`height`/`fps`, etc.), and any slug fitting the
+pattern works the day NIM ships it. The audio / video / image
+endpoints declare `DiscoverySupport.PARTIAL` — slug liveness is
+confirmed via the empty-payload-POST probe attached to each family,
+so a retired slug like the historical `nvidia/riva-tts` surfaces as
+`NOT_FOUND` at preflight rather than mid-pipeline 404. Chat declares
+`DiscoverySupport.NATIVE` and reads the
+`integrate.api.nvidia.com/v1/models` catalog directly.
 
-| Modality | Curated defaults |
-|---|---|
-| Video | `nvidia/cosmos-1.0-7b-diffusion-text2world`, `.../video2world`, `nvidia/cosmos-2.0-diffusion-*` |
-| Image | `stabilityai/stable-diffusion-xl`, `.../stable-diffusion-3-5-{large,large-turbo,medium}`, `black-forest-labs/flux.1-{schnell,dev}` |
-| Audio | `nvidia/fugatto`, `nvidia/riva-tts`, `nvidia/maxine-voice-font` |
-| Chat | None — pure pass-through. Use any NIM model id. |
+| Modality | Family pattern(s) | Example slugs |
+|---|---|---|
+| Video | `^nvidia/cosmos-` | `nvidia/cosmos-1.0-7b-diffusion-text2world`, `.../video2world`, `nvidia/cosmos-2.0-diffusion-*` |
+| Image | `^stabilityai/stable-diffusion`, `^black-forest-labs/flux` | `stable-diffusion-xl`, `stable-diffusion-3-5-{large,large-turbo,medium}`, `flux.1-{schnell,dev}` |
+| Audio | `^nvidia/fugatto`, `^nvidia/(?:magpie-tts\|riva-tts\|maxine-)` | `nvidia/fugatto`, `nvidia/magpie-tts-multilingual`, `nvidia/maxine-voice-font` |
+| Chat | n/a — `NATIVE` discovery | Any NIM chat model id |
+
+Pricing is **not shipped** — register a strategy from
+[`docs/reference/pricing-recipes.md`](../../../docs/reference/pricing-recipes.md)
+when one is published for the model line you use. Until then,
+`step.cost_usd` is `None`.
 
 Discover live models at runtime (if you want the fresh catalog) via the
 OpenAI-compatible `/v1/models` endpoint:
