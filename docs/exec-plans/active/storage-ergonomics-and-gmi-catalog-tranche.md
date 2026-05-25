@@ -1,7 +1,7 @@
 <!-- created: 2026-05-23 -->
 # Storage ergonomics & GMI catalog tranche
 
-**Status:** draft (v5 — testing strategy baked in) · **Owner:** unassigned · **Target wave:** `0.3.1 — storage ergonomics & GMI catalog hygiene (2026-05)` · **Shape:** A/F/D · **Feedback source:** user batch 2026-05-23 (7 items)
+**Status:** draft (v6 — 4/8 PRs shipped on `main`; B.1 simplified to manual checklist) · **Owner:** unassigned · **Target wave:** `0.3.2 — storage ergonomics & GMI catalog hygiene (2026-05)` · **Shape:** A/F/D · **Feedback source:** user batch 2026-05-23 (7 items)
 
 ## Goal
 
@@ -192,21 +192,23 @@ Why each: 404 from B2 is "definitely not here"; 403 is "you can't tell from this
 
 ## Theme B — GMICloud catalog hygiene
 
-### B.1 Run the existing probes (item 3)
+### B.1 Pre-release catalog verification (item 3) — simplified during PR-4
 
-**Tools (already on disk):**
+**Final shape:** docs-only manual checklist. The originally-planned scheduled CI probe was walked back during PR-4 implementation because provider catalogs rotate quarterly (per the 2026-04 reconciliation history) — weekly automated probes were overkill and carried real cost (~50 audit-log entries/run, plus the risk of a permissive upstream queue accepting a minimal probe payload and billing for a real generation job; `probe_gmicloud_wire.py`'s docstring calls out the best-effort cancel).
 
-- `tools/probe_models.py` — per-provider model probe; writes `docs/reference/model-probe-status.json`.
-- `tools/probe_gmicloud_wire.py` — GMI wire-conformance probe (slug case, per-i2v image key, PixVerse coercer); writes dated JSON+MD to `docs/reference/`.
+**Tools that already exist on disk (kept as optional programmatic sanity-check):**
 
-**Work:**
+- `tools/probe_models.py` — provider-agnostic; gated by `GENBLAZE_PROBE_<NAME>_API_KEY`. Writes `docs/reference/model-probe-status.json`.
+- `tools/probe_gmicloud_wire.py` — GMI wire-conformance probe (slug case, per-i2v image key, PixVerse coercer). Writes dated JSON+MD to `docs/reference/`.
 
-1. Run both probes against live GMI using `GMI_API_KEY_STAGING` (staging key for the dev account). Commit resulting JSON+MD reports to `docs/reference/`.
-2. Add a "Catalog drift detection" subsection to `docs/dev-workflows.md`:
-   - When to run: before each release wave; whenever a user reports a 404.
-   - How to read DEAD vs UNKNOWN.
-   - **Audit-log cost:** ~25 audit-log entries per `probe_gmicloud_wire.py` run (7 families × 2 casings + 3 i2v × 3 keys + 2 duration variants). `probe_models.py` adds one entry per registered slug. Run weekly maximum; do not run on every PR.
-3. Add `.github/workflows/probe-gmicloud.yml` — scheduled weekly (cron `0 6 * * 1`, Monday 06:00 UTC). Uses GH secret `GMI_API_KEY_STAGING`. On `NOT_FOUND` exit: **search for an existing open issue with title `[catalog-drift] GMICloud model probe NOT_FOUND` first; comment on it if found, otherwise create a new issue.** Avoids one-issue-per-week spam during sustained drift. **Does not gate PR CI** — GMI rotates models faster than the SDK ships.
+**Work (delivered):**
+
+1. Added `docs/dev-workflows.md` §"Pre-release catalog verification" with a per-provider table of upstream catalog/docs links (GMICloud, OpenAI, Google, Replicate, Runway, Luma, Decart, ElevenLabs, Stability Audio, LMNT, NVIDIA NIM — all link-verified).
+2. Added a 5-minute pre-release click-through checklist: open each connector's README quickstart, confirm every `model="..."` slug exists in the corresponding family's `example_slugs`, click through to the provider's catalog page to confirm the slug is still listed.
+3. Documented the existing `tools/probe_*.py` scripts as **optional** — flagged the small-but-nonzero cost risk so maintainers run them with intent, not by reflex.
+4. Discipline rule preserved: every README/example slug must also appear in its family's `example_slugs` (or `unstable_examples`), so the manual check has one source of truth per family.
+
+**What was deleted vs the v5 plan:** `.github/workflows/probe-catalog.yml` (191 LOC), the auto-issue-dedup logic, the 11 staging-secret env mappings, the 90-day artifact retention, the weekly cron. Zero recurring CI cost, zero audit-log noise, zero risk of paid probe jobs.
 
 **No new code in `libs/`.** This was a survey-first miss in v1.
 
@@ -351,7 +353,7 @@ Every implementing PR includes the relevant feature-doc update in the same diff 
 - PR-6 → `docs/features/object-storage.md` (sink `asset_url_policy` knob)
 - PR-7 → `docs/features/model-registry.md` if it exists, otherwise inline in connector READMEs (canonical_slug semantics + INFO log)
 
-### MIGRATING-0.3.1.md
+### MIGRATING-0.3.2.md
 
 New top-level doc cataloging user-visible changes from the wave:
 
@@ -366,30 +368,32 @@ Keep under 150 lines. Migration guides are read once and discarded.
 
 ## Release wave
 
-Wave name: `0.3.1 — storage ergonomics & GMI catalog hygiene (2026-05)` per `RELEASING.md` (CHANGELOG heading is the wave; tag follows).
+Wave name: `0.3.2 — storage ergonomics & GMI catalog hygiene (2026-05)` per `RELEASING.md` (CHANGELOG heading is the wave; tag follows). `0.3.1` was claimed by the 2026-05-18 `genblaze-s3` republish, so this wave's heading and tag are `0.3.2`. **Release is held until all 8 PRs land** — per-package version bumps stay in `[Unreleased]` until PR-8 renames the section.
 
-| Package | Change | Bump |
-|---------|--------|------|
-| `genblaze-s3` | A.1, A.2 wiring, A.3 | patch → `0.3.2` |
-| `genblaze-core` | A.2 sink kwarg + WARN, B.3 `canonical_slug` (conditional) | patch → `0.3.2` |
-| `genblaze-gmicloud` | B.2 docstring/example cleanup, B.3 family declarations (conditional) | patch → `0.3.1` |
-| `genblaze` (umbrella) | none — existing `>=0.3.0,<0.4` pins cover it | no bump |
-| root `pyproject.toml` | C — strip `[project]` | n/a |
+| Package | Change | Bump | Status |
+|---------|--------|------|--------|
+| `genblaze-s3` | A.1, A.3 (PR-1, PR-2); A.2 sink wiring (PR-6 pending) | patch → `0.3.2` | bumped in PR-1; held in `[Unreleased]` |
+| `genblaze-core` | A.2 sink kwarg + WARN (PR-6 pending) | patch → `0.3.1` | not yet bumped |
+| `genblaze-gmicloud` | B.2 docstring/example cleanup (PR-5 pending) | patch → `0.3.1` | not yet bumped |
+| `genblaze` (umbrella) | none — existing `>=0.3.0,<0.4` pins cover it | no bump | — |
+| root `pyproject.toml` | C — strip `[project]` (PR-3 ✅) | n/a | shipped |
+
+PR-7 (`canonical_slug`) is skipped per §Sequencing → no `genblaze-core 0.3.2` minor surface to declare.
 
 ## Sequencing
 
 Each PR ≤ ~400 LOC, single theme:
 
-1. **PR-1** (A.1): `presigned_get_url` / `presigned_put_url` + tests. ~50 LOC. `genblaze-s3 0.3.2`.
-2. **PR-2** (A.3): parallel region probe + 404 detection + tests. ~180 LOC. `genblaze-s3 0.3.2`.
-3. **PR-3** (C): strip `[project]` from root pyproject + CONTRIBUTING note. ~20 LOC.
-4. **PR-4** (B.1): run probes, commit reports, add `dev-workflows.md` subsection + `.github/workflows/probe-gmicloud.yml`. Docs + CI only. ~80 LOC.
-5. **PR-5** (B.2): prune dead slugs + add discipline rule to `dev-workflows.md` + `/scaffold-provider` skill. Driven by PR-4. ~100 LOC.
-6. **PR-6** (A.2): sink `URLPolicy` kwarg + module-level WARN + `PRESIGNED`-rejection + tests. ~300 LOC. `genblaze-core 0.3.2` + `genblaze-s3 0.3.2`.
-7. **PR-7** (B.3): `ModelFamily.canonical_slug` + `validate()`/`known()` plumbing + INFO log + family declarations + tests. ~280 LOC. **Conditional on PR-4 confirming wire-mismatch.** `genblaze-core 0.3.2` + `genblaze-gmicloud 0.3.1`.
-8. **PR-8** (cross-cutting): `MIGRATING-0.3.1.md` + CHANGELOG entry for the wave. ~120 LOC. Lands last; references shipped PRs.
+1. ✅ **PR-1** (A.1) — `presigned_get_url` / `presigned_put_url` + tests. Shipped at `a1449a4`. `genblaze-s3 0.3.2`.
+2. ✅ **PR-2** (A.3) — parallel region probe + 404 detection + tests. Shipped at `51a1d4f`. `genblaze-s3 0.3.2`.
+3. ✅ **PR-3** (C) — strip `[project]` from root pyproject. Shipped at `4796685`.
+4. ✅ **PR-4** (B.1) — pre-release catalog-verification checklist in `dev-workflows.md`. Shipped at `507a61c`; subsequently simplified (workflow deleted, replaced with manual checklist + provider catalog links).
+5. ⏳ **PR-5** (B.2) — prune dead slugs explicitly named in user feedback (`sora-2-pro`, `ElevenLabs-TTS-v3`, `seedream-5.0-lite`, lowercase `kling-image2video-v2.1-master`, Sora docstring mention). Driven by user feedback, not probe output. ~100 LOC.
+6. ⏳ **PR-6** (A.2) — sink `URLPolicy` kwarg + module-level WARN + `PRESIGNED`-rejection + tests. ~300 LOC. `genblaze-core 0.3.2` + `genblaze-s3 0.3.2`.
+7. 🚫 **PR-7** (B.3) — `ModelFamily.canonical_slug`. **Skipped** unless a future probe run surfaces concrete wire-form drift on a slug we ship. Originally conditional on PR-4's scheduled probe; with PR-4 simplified to manual checklist, the trigger is now "a maintainer runs the optional probe and finds a wire mismatch" — defer to a separate ticket if/when that happens.
+8. ⏳ **PR-8** (cross-cutting) — `MIGRATING-0.3.2.md` + CHANGELOG wave heading. ~120 LOC. Lands last; references shipped PRs.
 
-PR-4 unblocks PR-5 and PR-7. PR-1/2/3/6 are independent of each other and PR-4.
+PR-5/PR-6/PR-8 are independent of each other. **Recommended order: PR-6 → PR-5 → PR-8** (biggest test-coverage piece first, doc cleanup second, migration guide last).
 
 ## Out of scope
 

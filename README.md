@@ -333,7 +333,7 @@ from genblaze_gmicloud import GMICloudImageProvider, GMICloudVideoProvider
 run, manifest = (
     Pipeline("image-to-video", chain=True)
     .step(GMICloudImageProvider(), model="seedream-5.0-lite", prompt="cyberpunk cityscape", modality=Modality.IMAGE)
-    .step(GMICloudVideoProvider(), model="kling-image2video-v2.1-master", prompt="camera slowly pans right", modality=Modality.VIDEO)
+    .step(GMICloudVideoProvider(), model="Kling-Image2Video-V2.1-Master", prompt="camera slowly pans right", modality=Modality.VIDEO)
     .run(sink=storage, timeout=600)
 )
 

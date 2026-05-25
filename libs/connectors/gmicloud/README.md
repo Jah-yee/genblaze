@@ -18,13 +18,13 @@
 
 | Provider class | Modality | Example models |
 |---|---|---|
-| `GMICloudVideoProvider` | video | `kling-text2video-v1.6-pro`, `kling-image2video-v2.1-master`, `veo3`, `wan2.6-t2v`, `seedance-1-0-pro-250528`, `sora-2-pro` |
+| `GMICloudVideoProvider` | video | `Kling-Text2Video-V2.1-Master`, `Kling-Image2Video-V2.1-Master`, `Veo3`, `wan2.6-t2v`, `seedance-1-0-pro-250528`, `sora-2-pro` |
 | `GMICloudImageProvider` | image | `seedream-5.0-lite`, `gemini-2.5-flash-image`, `reve-edit-fast-20251030`, `flux-kontext-pro` |
 | `GMICloudAudioProvider` | audio | `ElevenLabs-TTS-v3`, `MiniMax-TTS-Speech-2.6-Turbo`, `MiniMax-Music-2.5` |
 
 Registered via entry points as `gmicloud`, `gmicloud-image`, and `gmicloud-audio`. Any model on GMICloud's queue is supported — pass the exact model slug.
 
-> **Slug casing** — GMICloud's request queue is case-sensitive. Model ids are the lowercase slugs shown above. Pre-0.3 PascalCase ids (e.g. `Seedream-5.0-Lite`, `Veo3`, `Wan-2.6-I2V`) still resolve via `ModelSpec.deprecated_aliases` but emit a `DeprecationWarning` and will be removed in 0.4 — migrate early.
+> **Slug casing** — GMICloud's request queue is case-sensitive and uses **per-slug casing** (per their published catalog): lowercase for Sora/Pixverse/Seedance/Seedream/Reve/Wan/Bria/Gemini-Image and newer Kling V2.5/V3 series; PascalCase for Kling V2.1, Veo3, and (per current code, under verification) the audio families. Pass the exact casing GMICloud publishes on [console.gmicloud.ai](https://console.gmicloud.ai/); the connector does not rewrite the slug. The 0.3.0 wave removed the previous `ModelSpec.deprecated_aliases` rewrite layer — update call sites directly when a slug rotates.
 
 ## Install
 
@@ -45,7 +45,7 @@ from genblaze_gmicloud import GMICloudVideoProvider
 
 run, manifest = (
     Pipeline("gmicloud-video-demo")
-    .step(GMICloudVideoProvider(), model="kling-text2video-v1.6-pro",
+    .step(GMICloudVideoProvider(), model="Kling-Text2Video-V2.1-Master",
           prompt="A drone shot flying over a misty mountain valley at sunrise, cinematic",
           modality=Modality.VIDEO, duration=10, aspect_ratio="16:9")
     .run(timeout=600)

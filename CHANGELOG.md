@@ -41,20 +41,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and R2 backends are unaffected. Addresses the 2026-05-23 feedback batch
   item 6.
 
+### Fixed
+
+- **GMICloud README + examples: corrected Kling slug casing + Veo casing.**
+  Verified against GMICloud's own blog posts (no third-party sources used).
+  The newest authoritative source is the [2026-04-14 Real-Time Video
+  Generation Platforms blog](https://www.gmicloud.ai/en/blog/real-time-video-generation-platforms);
+  cross-checked against the [2026-03-10 Most Popular AI Models blog](https://www.gmicloud.ai/en/blog/the-most-popular-ai-models-available-today)
+  and the [2026-03-04 Compare Generative Media blog](https://www.gmicloud.ai/en/blog/compare-generative-media-ai-platforms-video-and-image).
+
+  Changes:
+  - `kling-text2video-v1.6-pro` → `Kling-Text2Video-V2.1-Master` (the V1.6-Pro
+    text2video slug doesn't appear in any GMICloud blog; the V2.1-Master form
+    is explicit in the 2026-04-14 blog at $0.28/req).
+  - `kling-image2video-v2.1-master` → `Kling-Image2Video-V2.1-Master`
+    (PascalCase per 2026-03-04 blog; the V2.1 designation is confirmed by
+    the 2026-04-14 blog's matching Kling-Text2Video-V2.1-Master casing).
+  - `veo3` → `Veo3` in the connector README provider table (PascalCase per
+    every GMICloud blog from 2025-12-08 onward).
+
+  Touched: `libs/connectors/gmicloud/README.md` (provider table, video
+  quickstart), root `README.md` (chain example), `examples/gmicloud_video_pipeline.py`.
+
+- **Rewrote the stale "Slug casing" note in `libs/connectors/gmicloud/README.md`.**
+  The previous note claimed all GMI slugs are lowercase and that PascalCase
+  ids rewrite via `ModelSpec.deprecated_aliases` — both false. Replaced with
+  an accurate per-slug-casing description (GMICloud's published catalog
+  uses lowercase for Sora/Pixverse/Seedance/Seedream/Reve/Wan/Bria/Gemini-Image
+  and PascalCase for Kling V2.1 + Veo3, while newer Kling V2.5/V3 series use
+  lowercase — verify on `console.gmicloud.ai` per slug).
+
+### Deferred (verify before wave ships)
+
+- **Audio family slug casing (separate follow-up PR — ~7 file code change).**
+  Our code uses PascalCase: `ElevenLabs-TTS-v3`, `MiniMax-TTS-Speech-2.6-Turbo`,
+  `MiniMax-Music-2.5`, `MiniMax-Voice-Clone-Speech-2.6-HD`, `Inworld-TTS-1.5-Mini`
+  (in `models/audio.py` family patterns, `voices.py` defaults, README + example
+  quickstarts). The 2026-03-10 GMICloud blog lists these as **lowercase**:
+  `elevenlabs-tts-v3` ($0.10), `minimax-tts-speech-2.6-turbo` ($0.06),
+  `minimax-music-2.5` ($0.15), `inworld-tts-1.5-mini` ($0.005),
+  `minimax-audio-voice-clone-speech-2.6-hd` ($0.10). If lowercase is the
+  actual wire-accepted form, a follow-up PR rewrites the audio family
+  pattern, `voices.py` defaults, audio quickstart, and audio example.
+  Confirm via `console.gmicloud.ai` or `python tools/probe_gmicloud_wire.py`
+  before the wave ships.
+
+- **Video family `example_slugs` casing in `models/video.py`.**
+  The Veo family pattern is `re.compile(r"^veo\d+")` (lowercase) with
+  `example_slugs=("veo3",)`. GMICloud's published form is `Veo3` PascalCase.
+  A user passing `Veo3` falls through to the fallback (still works, but
+  doesn't get the family's `extras["has_audio"]=True` plumbing). Same
+  concern as the audio family — code change deferred to the audio-casing
+  reconciliation PR.
+
+- **Kling V2.1 slugs in the connector code.** The README quickstart now
+  uses `Kling-Text2Video-V2.1-Master` and `Kling-Image2Video-V2.1-Master`,
+  but no family pattern in `models/video.py` matches them (they hit the
+  fallback). Adding a Kling family is part of the same code-casing
+  follow-up — not required for the README slugs to work via pass-through.
+
 ### Internal
 
-- **Catalog-drift CI hook**: new `.github/workflows/probe-catalog.yml`
-  runs the existing `tools/probe_models.py` (provider-agnostic) +
-  `tools/probe_gmicloud_wire.py` (GMI wire-conformance) weekly (Monday
-  06:00 UTC) and on-demand via `workflow_dispatch`. Pre-listed env vars
-  for all 21 provider entry points → adding probe coverage for a new
-  provider is a 2-line YAML change plus one GH secret. Providers without
-  configured secrets skip silently; the wire probe is gated on
-  `GMI_API_KEY_STAGING` being set. On `NOT_FOUND`, dedupes against any
-  open `[catalog-drift]`-titled issue (one global issue across all
-  providers — the attached JSON pinpoints which slug drifted). Reports
-  uploaded as artifacts (90-day retention); does not gate PR CI.
-  See [docs/dev-workflows.md §Catalog drift detection](docs/dev-workflows.md#catalog-drift-detection).
+- **Pre-release catalog verification checklist**: new
+  [`docs/dev-workflows.md` §"Pre-release catalog verification"](docs/dev-workflows.md#pre-release-catalog-verification)
+  with a per-provider table of upstream catalog/docs links. Maintainers
+  click through before tagging a release to confirm that every slug in
+  `family.example_slugs` and the README quickstarts still resolves on
+  the provider's published catalog. Replaces an earlier scheduled CI
+  probe design — provider catalogs rotate ~quarterly, so weekly polling
+  was overkill and carried real audit-log + potential-paid-job cost.
+  The existing `tools/probe_*.py` scripts remain as an optional
+  programmatic sanity-check.
 
 ### Fixed
 

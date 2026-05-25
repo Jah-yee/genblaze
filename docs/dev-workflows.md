@@ -79,69 +79,64 @@
 3. Implement fix
 4. Rerun tests until green
 
-## Catalog drift detection
+## Pre-release catalog verification
 
-Provider catalogs change faster than the SDK ships. Two probe tools live in `tools/`; both make real network calls against live APIs and write reports to `docs/reference/`.
+Provider catalogs rotate independently of the SDK (typically once per few months). Before tagging a release wave, manually verify that every slug shipped in `family.example_slugs`, the connector READMEs, and the root `README.md` still resolves on the upstream's published catalog.
 
-| Tool | Scope | Report path |
-|------|-------|-------------|
-| `tools/probe_models.py` | Every entry-point-registered provider's `example_slugs`. Exits 1 on any `NOT_FOUND`. | `docs/reference/model-probe-status.json` |
-| `tools/probe_gmicloud_wire.py` | GMICloud-specific: per-slug casing, per-i2v image wire-key, PixVerse duration coercer. | `docs/reference/gmicloud-wire-probe-{date}.{json,md}` |
+This is a human-inspection step, not an automated probe. Upstream catalog pages are the authoritative source; their HTML/JSON is more current than any rate-limited API discovery endpoint.
 
-### When to run
+### Provider catalog pages
 
-- Before tagging a release wave — catches model rotations that would silently break quickstarts.
-- When a user reports a 404 on a slug listed in the README or `example_slugs`.
-- On a weekly schedule via `.github/workflows/probe-catalog.yml` (auto-opens / comments on a `[catalog-drift]` issue when any provider returns `NOT_FOUND`).
+| Provider | Where to verify slugs | Notes |
+|----------|----------------------|-------|
+| GMICloud | https://console.gmicloud.ai/ | Sign-in required. Check the "Models" section for live availability. |
+| OpenAI | https://platform.openai.com/docs/models | Public docs; Sora / DALL-E / GPT-Image / TTS sections. |
+| Google (Veo, Imagen, Gemini Image) | https://ai.google.dev/gemini-api/docs/models | Plus https://deepmind.google/technologies/veo/ for Veo specifics. |
+| Replicate | https://replicate.com/explore | Public catalog; search by slug. |
+| Runway | https://docs.dev.runwayml.com/ | API docs list supported `model` values for video generation. |
+| Luma | https://docs.lumalabs.ai/ | Dream Machine API docs list supported model strings. |
+| Decart | https://platform.decart.ai/ | Sign-in required for full catalog. |
+| ElevenLabs | https://elevenlabs.io/docs/api-reference/models/list | Public docs. |
+| Stability (audio) | https://platform.stability.ai/docs/api-reference | Stable Audio section. |
+| LMNT | https://docs.lmnt.com/ | Public docs; voices + models. |
+| NVIDIA NIM | https://build.nvidia.com/explore | Public catalog; live model listing. |
 
-### Onboarding a new provider's probe coverage
+Keep this table aligned with `libs/connectors/*/` — when a new connector lands, add its provider's catalog link here in the same PR.
 
-1. Add the `GENBLAZE_PROBE_<NAME>_API_KEY` mapping to the workflow's `env:` block, pointing at the appropriate staging secret. Multiple entry points sharing one upstream account (e.g. `nvidia-video`/`nvidia-image`/`nvidia-audio`/`nvidia-chat`) reuse the same `<provider>_API_KEY_STAGING` secret.
-2. Configure that secret in repo Settings → Secrets and variables → Actions.
+### Pre-release checklist
 
-That's it — no further code or CI changes. `probe_models.py` walks every entry-point-registered provider and skips those without credentials, so unconfigured providers stay quiet until their secret comes online.
+Before cutting any release wave that includes connector changes:
 
-### Isolation guarantees (missing-key behavior)
+1. Open each connector's README quickstart. For every `model="..."` slug:
+   - Confirm the slug appears in the corresponding family's `example_slugs` tuple (or `unstable_examples` if intentionally flagged flaky).
+   - Click through to the provider's catalog page above. Confirm the slug is still listed.
+2. Skim `examples/*_pipeline.py` for any `model=` references; same check.
+3. If a slug is gone:
+   - Prune it from the README quickstart.
+   - Prune (or move to `unstable_examples`) the family's `example_slugs` entry.
+   - Update any example scripts.
 
-The probe is designed so any one provider's missing credential, broken package, or upstream outage cannot block coverage for the others:
+Total time: ~5 minutes per release.
 
-| Failure | Behavior |
-|---------|----------|
-| Provider's GH secret not configured | Env var resolves to empty → `probe_models.py` marks that provider `skipped` → no failure, no issue |
-| Provider's package fails to install | Workflow's tolerant install loop captures the error as a `::warning::` and continues; `probe_models.py` doesn't see that provider in entry points and silently skips it |
-| Provider's upstream API down (transient 5xx) | Probe records `unknown` status; does **not** trigger a `[catalog-drift]` issue (only `not_found` does) |
-| GMI staging key absent | `probe_gmicloud_wire.py` step is gated on `env.GMI_API_KEY != ''` and skipped cleanly; other probes unaffected |
+### Optional programmatic sanity-check
 
-The only outcome that opens an issue is a configured provider returning `not_found` — i.e. real catalog drift on a provider the workflow can actually exercise.
-
-### Local invocation
+Two probe tools exist in `tools/` if you want a programmatic confirmation alongside the manual click-through. They make real network calls and may incur small upstream cost (a few audit-log entries per run, occasionally a paid generation job if a provider's queue accepts the minimal probe payload — see each tool's docstring). Run manually before a release wave when you want an extra signal:
 
 ```bash
-# All providers (skips any whose GENBLAZE_PROBE_<NAME>_API_KEY isn't set):
+# Provider-agnostic: probes every registered provider whose
+# GENBLAZE_PROBE_<NAME>_API_KEY env var is set; skips the rest.
 python tools/probe_models.py
 
-# Just the GMI wire-conformance probe (slug casing + wire keys):
+# GMICloud-specific: slug casing + wire-key + PixVerse coercer matrix.
 export GMI_API_KEY="gmi-..."
 python tools/probe_gmicloud_wire.py
 ```
 
-### Reading the report
-
-- **`ok`** — slug accepted by upstream.
-- **`not_found`** — upstream returned 404. The slug is dead; prune it from family `example_slugs` and any README quickstart.
-- **`auth`** — credential rejected. Re-check the probe env var.
-- **`skipped`** — no credential supplied; not a failure.
-- **`unknown`** — transient (5xx, network blip). Re-run; do NOT prune.
-
-Cross-reference the wire-probe's slug-case matrix before pruning a "not_found" lowercase slug — GMICloud may accept the PascalCase variant of the same model.
-
-### Audit-log cost
-
-Each `probe_gmicloud_wire.py` run creates ~25 audit-log entries on the configured GMI account (matrix submissions, each rejected by upstream as expected). `probe_models.py` adds ~one entry per registered slug. Run weekly maximum; do not gate per-PR CI on these probes.
+Reports land in `docs/reference/`. `not_found` means the slug is dead and should be pruned; `unknown` means transient (re-run, don't prune).
 
 ### Discipline rule for README + example_slugs
 
-Every slug used in any README quickstart, provider docstring, or `examples/*_pipeline.py` script **must also appear in its family's `example_slugs` tuple** (or `unstable_examples` for known-flaky slugs). Brings README slugs under the existing probe's coverage without new test infrastructure.
+Every slug used in any README quickstart, provider docstring, or `examples/*_pipeline.py` script **must also appear in its family's `example_slugs` tuple** (or `unstable_examples` for known-flaky slugs). Keeps the manual check above tractable — one source of truth per family.
 
 ## Doc Update Mapping
 
