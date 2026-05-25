@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and R2 backends are unaffected. Addresses the 2026-05-23 feedback batch
   item 6.
 
+### Fixed
+
+- **Repo dev install**: stripped the stub `[project]` block from the root
+  `pyproject.toml`. The stub declared `name="genblaze" version="0.1.0"`
+  with empty dependencies, which made `pip install -e .` from the repo
+  root install an extras-less 0.1.0 placeholder that shadowed the real
+  `genblaze` umbrella from `libs/meta`. Users following the README saw
+  *"no matching distribution for genblaze-gmicloud"* on `pip install -e
+  ".[gmicloud]"` even though the umbrella on PyPI works correctly. After
+  the strip, `pip install -e .` from the root fails cleanly (hatchling:
+  *"Missing 'project' metadata table"*); use `make install-dev` for
+  editable monorepo dev installs. Addresses the 2026-05-23 feedback batch
+  item 4.
+
 ## [0.3.1] - 2026-05-18
 
 ### Released package versions

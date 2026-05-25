@@ -1,17 +1,21 @@
+# Root pyproject — tool config only. The repo is a monorepo of individually-
+# installable packages (libs/core, libs/connectors/*, libs/meta, cli); each
+# carries its own pyproject.toml with its own [project] metadata. The
+# umbrella ``genblaze`` package ships from libs/meta — NOT from here.
+#
+# A stub [project] block used to live here (name="genblaze" version="0.1.0",
+# empty deps), which caused ``pip install -e .`` from the repo root to
+# shadow the real umbrella with an extras-less 0.1.0 stub. See CHANGELOG
+# for the release that removed it. Use ``make install-dev`` for editable
+# monorepo dev installs.
+#
+# [build-system] is retained so PEP 517 frontends (pip, build, etc.) that
+# inspect this file find a declared backend. Without a [project] block
+# hatchling errors out cleanly on any build attempt — the desired outcome.
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[project]
-name = "genblaze"
-version = "0.1.0"
-description = "Orchestration framework for media generation with manifest persistence"
-requires-python = ">=3.11"
-license = "MIT"
-dependencies = []
-
-[tool.hatch.build]
-skip-excluded-dirs = true
 
 [tool.pytest.ini_options]
 testpaths = ["libs/core/tests"]
