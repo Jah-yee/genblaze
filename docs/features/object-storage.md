@@ -255,6 +255,28 @@ transient credentials. **`put()` now returns the storage key** (a plain
 `str`); compose with `get_durable_url` for the persistable form, or use
 the methods above for an explicit credential-bearing URL.
 
+#### `presigned_get_url` / `presigned_put_url` — raw-`str` companions
+
+Added in `genblaze-s3` 0.3.2. When the call site immediately hands the URL
+to an HTTP client (or returns it across an API boundary), the
+`PresignedURL` wrapper's redacted `__str__` becomes a footgun — naïve
+`requests.get(backend.presigned_get("k"))` silently hits the redacted form
+and 403s on a SigV4 mismatch. The `_url` companions return a plain `str`:
+
+```python
+# Use at the boundary where the URL leaves the process:
+download_url = backend.presigned_get_url("k", expires_in=3600)
+requests.get(download_url)
+
+upload_url = backend.presigned_put_url("k", content_type="image/png")
+# Caller MUST send Content-Type: image/png if content_type was bound.
+```
+
+Equivalent to `backend.presigned_get(k).url` — pick whichever reads more
+naturally at the call site. Use the wrapped form (`presigned_get`) for
+intermediate handling so any accidental logging stays redacted; use the
+`_url` companion when the next thing the URL touches is an HTTP client.
+
 > **`presigned_post` is intentionally deferred.** S3 POST policies return a
 > `{"url", "fields"}` shape that doesn't fit `PresignedURL`. Tracked for a
 > later phase that ships a separate `PresignedPost` value object.

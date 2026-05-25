@@ -1,4 +1,4 @@
-.PHONY: install install-dev test lint fmt typecheck coverage clean ts-types ts-types-check release-smoke
+.PHONY: install install-dev test lint fmt typecheck coverage clean ts-types ts-types-check pypi-metadata-check release-smoke pre-release post-release
 
 install:
 	pip install -e libs/core
@@ -100,3 +100,48 @@ pypi-metadata-check:
 # bypass. Run this before tagging a release.
 release-smoke:
 	@tools/release_smoke.sh
+
+# Local pre-flight before tagging a release. Runs the same gates the
+# release workflow runs (validate-version excepted — that needs the
+# tag and the CHANGELOG cut). A clean ``make pre-release`` on ``main``
+# is a strong signal the publish pipeline will be green. Ordered for
+# quick-fail: cheap checks first, then the full test suite and the
+# wheelhouse smoke. See RELEASING.md.
+pre-release: lint typecheck ts-types-check pypi-metadata-check test release-smoke
+	@echo ""
+	@echo "pre-release gates passed."
+	@echo "Next: bump pyproject.toml versions, cut CHANGELOG, tag, gh release create."
+	@echo "See RELEASING.md for the full flow."
+
+# Post-publish verification. Installs the umbrella from public PyPI
+# into a throwaway venv and imports the core surface, mirroring what
+# real users see — this is what catches the same-version-different-
+# content trap that bit the 0.3.0 wave. Pass the umbrella version via
+# VERSION=<X.Y.Z>:
+#
+#   make post-release VERSION=0.4.0
+#
+# VERSION is the umbrella version (libs/meta/pyproject.toml), which
+# may differ from the wave name (e.g. wave 0.3.0 shipped umbrella
+# 0.4.0). On failure the venv is left in place for inspection.
+post-release:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "ERROR: VERSION is required. Usage: make post-release VERSION=0.4.0"; \
+		exit 1; \
+	fi
+	@set -e; \
+		VENV=$$(mktemp -d)/verify-$(VERSION); \
+		echo "Creating fresh venv at $$VENV"; \
+		python -m venv $$VENV; \
+		$$VENV/bin/pip install --quiet --upgrade pip; \
+		echo "Installing genblaze[all]==$(VERSION) from public PyPI..."; \
+		$$VENV/bin/pip install "genblaze[all]==$(VERSION)"; \
+		echo ""; \
+		echo "Smoke-importing core surface..."; \
+		$$VENV/bin/python -c "import genblaze_core, genblaze_s3; print('import ok')"; \
+		echo ""; \
+		echo "Installed versions:"; \
+		$$VENV/bin/pip show genblaze genblaze-core genblaze-s3 | grep -E '^(Name|Version)'; \
+		rm -rf $$(dirname $$VENV); \
+		echo ""; \
+		echo "genblaze==$(VERSION) verified on PyPI."

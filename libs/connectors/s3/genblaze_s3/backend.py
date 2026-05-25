@@ -1126,8 +1126,9 @@ class S3StorageBackend(StorageBackend):
         you want the URL value to default-redact in logs / repr / str
         (the :class:`PresignedURL` value object strips
         ``X-Amz-Signature`` / ``X-Amz-Credential`` from its formatted
-        output). Access the unredacted URL via the ``.url`` attribute
-        when handing it to an HTTP client — that makes every
+        output). Access the unredacted URL via the ``.url`` attribute —
+        or call :meth:`presigned_get_url` for the raw ``str`` directly —
+        when handing it to an HTTP client. That makes every
         unredacted-leak site a deliberate decision rather than a default
         string interpolation.
 
@@ -1168,6 +1169,9 @@ class S3StorageBackend(StorageBackend):
         the signature check fails. Pass ``content_type=`` here to lock
         it in; omit to let the upload pick.
 
+        See :meth:`presigned_put_url` for a plain-``str`` companion when
+        the caller is ready to hand the URL to an HTTP client.
+
         Args:
             key: The storage key to sign an upload URL for.
             expires_in: Seconds until expiry. Defaults to 3600 (1h).
@@ -1196,6 +1200,32 @@ class S3StorageBackend(StorageBackend):
             bucket=self._bucket,
             expires_in=expires_in,
         )
+
+    def presigned_get_url(self, key: str, *, expires_in: int = _DEFAULT_EXPIRES_IN_SEC) -> str:
+        """Raw presigned GET URL — bypasses :class:`PresignedURL` redaction.
+
+        Convenience over ``self.presigned_get(key, expires_in=...).url`` for
+        call sites that immediately hand the URL to an HTTP client (or
+        return it across an API boundary). Use only at the boundary where
+        the URL leaves the process; for everything else prefer
+        :meth:`presigned_get` and access ``.url`` explicitly so the
+        unredacted-leak site stays grep-able.
+        """
+        return self.presigned_get(key, expires_in=expires_in).url
+
+    def presigned_put_url(
+        self,
+        key: str,
+        *,
+        expires_in: int = _DEFAULT_EXPIRES_IN_SEC,
+        content_type: str | None = None,
+    ) -> str:
+        """Raw presigned PUT URL — bypasses :class:`PresignedURL` redaction.
+
+        Convenience over ``self.presigned_put(...).url``. See
+        :meth:`presigned_get_url` for the usage caveat.
+        """
+        return self.presigned_put(key, expires_in=expires_in, content_type=content_type).url
 
     def get_durable_url(self, key: str) -> str:
         """Return a credential-free, never-expiring URL safe to persist.

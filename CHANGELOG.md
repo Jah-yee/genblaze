@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `genblaze-s3`: `S3StorageBackend.presigned_get_url(key, ...)` and
+  `presigned_put_url(key, ...)` — raw-`str` companions to `presigned_get` /
+  `presigned_put`. Use at the boundary where the URL leaves the process
+  (HTTP client call, API response). Equivalent to
+  `backend.presigned_get(key).url` but discoverable from autocomplete
+  alongside the wrapped form. Addresses the 2026-05-23 feedback batch
+  item 1 — naïve `requests.get(backend.presigned_get("k"))` previously
+  hit the redacted `__str__` and 403'd on a SigV4 mismatch. The wrapped
+  `presigned_get` / `presigned_put` remain the safe default; the `_url`
+  companions are the explicit raw-string escape hatch.
+
 ## [0.3.1] - 2026-05-18
 
 ### Released package versions

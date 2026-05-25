@@ -51,6 +51,18 @@ Before cutting a release, verify on `main`:
    release workflow re-runs it as a defense in depth.)
 4. **CI is green** on the commit you're about to release.
 
+Step 3 plus the local equivalents of every gate the publish pipeline
+will run are bundled into a single target:
+
+```bash
+make pre-release
+```
+
+This runs `lint`, `typecheck`, `ts-types-check`, `pypi-metadata-check`,
+`test`, and `release-smoke` in quick-fail order. A clean run on `main`
+is a strong signal that `validate-version`, `changelog-gate`, and
+`release-smoke` in the workflow will all be green once you tag.
+
 ## The publish pipeline
 
 Defined in [`.github/workflows/release.yml`](.github/workflows/release.yml).
@@ -213,6 +225,28 @@ production releases (recommended once the project graduates from alpha).
   green publish graph usually means the package is fine and the index
   is just behind — verify manually with `pip install genblaze==X.Y.Z`
   in a fresh venv before assuming a regression.
+
+## Post-publish verification
+
+`install-verify` runs inside the workflow, but it lives in the same
+GitHub Actions runner that just published — same network, same caches.
+After a release lands, do an independent check from your local machine
+against public PyPI:
+
+```bash
+make post-release VERSION=0.4.0
+```
+
+`VERSION` is the **umbrella** version from `libs/meta/pyproject.toml`,
+not the wave name (e.g. wave 0.3.0 shipped umbrella 0.4.0). The target
+creates a throwaway venv in `/tmp`, installs `genblaze[all]==$VERSION`
+from public PyPI, imports `genblaze_core` and `genblaze_s3`, and prints
+the installed versions of each. On failure the venv is left in place
+so you can re-run the failing command interactively.
+
+This is the same check that caught the 0.3.0 `genblaze-s3` dependency-
+pin drift after `install-verify` lagged — it's a backstop, not
+redundant.
 
 ## Releasing manually (fallback only)
 

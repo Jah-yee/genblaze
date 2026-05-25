@@ -433,3 +433,92 @@ class TestPresignedPut:
         )
         with pytest.raises(StorageError, match="presigned_put"):
             backend.presigned_put("k")
+
+
+# ---------------------------------------------------------------------------
+# presigned_get_url / presigned_put_url — raw-string companions (PR-1, 0.3.2)
+# ---------------------------------------------------------------------------
+
+
+class TestPresignedURLCompanions:
+    """Pin the contract: the ``_url`` companions are ``str``-typed convenience
+    over ``presigned_get(...).url``. They exist so call sites passing a URL
+    to ``requests.get(...)`` etc. don't accidentally pass the redacted
+    ``__str__`` form of :class:`PresignedURL` (a footgun confirmed in the
+    2026-05-23 feedback batch — see ``dx-feedback-batch-2026-05`` item 1).
+    """
+
+    def test_get_url_returns_plain_str(self, mock_boto3):
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = (
+            "https://example.s3.amazonaws.com/k?X-Amz-Signature=abc"
+        )
+        result = backend.presigned_get_url("k")
+        assert isinstance(result, str)
+        # Not a PresignedURL — plain str so HTTP clients consume it directly
+        # without invoking ``__str__`` (which would redact).
+        assert not isinstance(result, PresignedURL)
+        assert "X-Amz-Signature=abc" in result
+
+    def test_put_url_returns_plain_str(self, mock_boto3):
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = "https://signed/upload?sig=xyz"
+        result = backend.presigned_put_url("k")
+        assert isinstance(result, str)
+        assert result == "https://signed/upload?sig=xyz"
+
+    def test_get_url_propagates_expires_in(self, mock_boto3):
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = "https://signed/fetch"
+        backend.presigned_get_url("k", expires_in=900)
+        assert mock_client.generate_presigned_url.call_args.kwargs["ExpiresIn"] == 900
+
+    def test_put_url_propagates_content_type_binding(self, mock_boto3):
+        """``content_type`` binds into SigV4 via ``Params.ContentType`` —
+        the companion must forward the kwarg, not silently drop it."""
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = "https://signed/upload"
+        backend.presigned_put_url("k", expires_in=600, content_type="image/png")
+        kwargs = mock_client.generate_presigned_url.call_args.kwargs
+        assert kwargs["ExpiresIn"] == 600
+        assert kwargs["Params"]["ContentType"] == "image/png"
+
+    def test_get_url_equivalence_with_presigned_get_dot_url(self, mock_boto3):
+        """``presigned_get_url(k)`` must equal ``presigned_get(k).url``
+        byte-for-byte — they're alternate spellings of the same answer."""
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = "https://signed/fetch?sig=z"
+        via_companion = backend.presigned_get_url("k")
+        via_dot_url = backend.presigned_get("k").url
+        assert via_companion == via_dot_url
+
+    def test_str_of_presigned_get_still_redacts(self, mock_boto3):
+        """Safety property: the ``PresignedURL`` value object's ``__str__``
+        stays redacted. The ``_url`` companion is the ONLY new escape hatch."""
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.return_value = (
+            "https://example.s3.amazonaws.com/k?X-Amz-Signature=deadbeef"
+        )
+        wrapped = backend.presigned_get("k")
+        assert "deadbeef" not in str(wrapped)
+        assert "deadbeef" not in repr(wrapped)
+        # But the companion exposes it on demand:
+        assert "deadbeef" in backend.presigned_get_url("k")
+
+    def test_get_url_propagates_storage_error_unchanged(self, mock_boto3):
+        """If ``presigned_get`` raises ``StorageError``, ``presigned_get_url``
+        raises the SAME exception (no wrapping, no swallowing)."""
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.side_effect = _FakeClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GeneratePresignedUrl"
+        )
+        with pytest.raises(StorageError, match="presigned_get"):
+            backend.presigned_get_url("k")
+
+    def test_put_url_propagates_storage_error_unchanged(self, mock_boto3):
+        backend, mock_client = _make_backend(mock_boto3)
+        mock_client.generate_presigned_url.side_effect = _FakeClientError(
+            {"Error": {"Code": "AccessDenied"}}, "GeneratePresignedUrl"
+        )
+        with pytest.raises(StorageError, match="presigned_put"):
+            backend.presigned_put_url("k")
